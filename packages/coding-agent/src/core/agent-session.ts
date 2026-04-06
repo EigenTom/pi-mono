@@ -118,6 +118,13 @@ export type AgentSessionEvent =
 			steering: readonly string[];
 			followUp: readonly string[];
 	  }
+	| {
+			type: "provider_request_context";
+			requestIndex: number;
+			model?: { provider: string; id: string };
+			messages: AgentMessage[];
+			payload: unknown;
+	  }
 	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
 	| {
 			type: "compaction_end";
@@ -255,6 +262,8 @@ export class AgentSession {
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
 	private _inLoopCompactionFailures = 0;
+	private _pendingProviderContextMessages: AgentMessage[] = [];
+	private _providerRequestCount = 0;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -387,10 +396,26 @@ export class AgentSession {
 			}
 		};
 
+		const baseOnPayload = this.agent.onPayload;
+		this.agent.onPayload = async (payload, model) => {
+			const effectivePayload = baseOnPayload ? await baseOnPayload(payload, model) : payload;
+			this._providerRequestCount += 1;
+			this._emit({
+				type: "provider_request_context",
+				requestIndex: this._providerRequestCount,
+				model: model ? { provider: model.provider, id: model.id } : undefined,
+				messages: structuredClone(this._pendingProviderContextMessages),
+				payload: structuredClone(effectivePayload),
+			});
+			return effectivePayload;
+		};
+
 		const baseTransformContext = this.agent.transformContext;
 		this.agent.transformContext = async (messages, signal) => {
 			const transformed = baseTransformContext ? await baseTransformContext(messages, signal) : messages;
-			return this._applyRuntimeContextManagement(transformed, signal);
+			const finalMessages = await this._applyRuntimeContextManagement(transformed, signal);
+			this._pendingProviderContextMessages = structuredClone(finalMessages);
+			return finalMessages;
 		};
 
 		this.agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
