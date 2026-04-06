@@ -29,6 +29,16 @@ OSS weekend runs Thursday, April 2, 2026 through Monday, April 13, 2026. New iss
 
 > **Looking for the pi coding agent?** See **[packages/coding-agent](packages/coding-agent)** for installation and usage.
 
+This fork also carries runtime context-management profiles for ablation work. The coding-agent CLI accepts:
+
+```bash
+pi --context-management-level level0
+pi --context-management-level legacy
+pi --context-management-level level5
+```
+
+See [packages/coding-agent](packages/coding-agent) for the level definitions and detailed examples.
+
 Tools for building AI agents and managing LLM deployments.
 
 ## Packages

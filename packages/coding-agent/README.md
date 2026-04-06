@@ -253,6 +253,15 @@ Pi also supports runtime context-management profiles for tool-heavy runs. These 
 
 Select a profile with `--context-management-level <level>` or `--runtime-context-level <level>`.
 
+Quick reference:
+
+- `level0`: current upstream behavior
+- `level1`: truncate only
+- `level2`: stronger truncation only
+- `level3`: truncation plus micro-compaction
+- `legacy` / `level4`: closest to the older runtime behavior
+- `level5`: most aggressive runtime profile
+
 Compaction is lossy. The full history remains in the JSONL file; use `/tree` to revisit. Customize compaction behavior via [extensions](#extensions). See [docs/compaction.md](docs/compaction.md) for internals.
 
 ---
@@ -587,6 +596,13 @@ pi --thinking high "Solve this complex problem"
 
 # Restore older runtime context management
 pi --context-management-level legacy
+
+# Ablation ladder
+pi --context-management-level level0
+pi --context-management-level level1
+pi --context-management-level level2
+pi --context-management-level level3
+pi --context-management-level level4
 
 # Run the strongest runtime ablation profile
 pi --context-management-level level5 -p "Summarize this repository"
