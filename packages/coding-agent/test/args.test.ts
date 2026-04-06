@@ -130,6 +130,29 @@ describe("parseArgs", () => {
 			const result = parseArgs(["--models", "gpt-4o,claude-sonnet,gemini-pro"]);
 			expect(result.models).toEqual(["gpt-4o", "claude-sonnet", "gemini-pro"]);
 		});
+
+		test("parses --context-management-level", () => {
+			const result = parseArgs(["--context-management-level", "legacy"]);
+			expect(result.contextManagementLevel).toBe("legacy");
+		});
+
+		test("parses --runtime-context-level alias", () => {
+			const result = parseArgs(["--runtime-context-level", "level4"]);
+			expect(result.contextManagementLevel).toBe("level4");
+		});
+	});
+
+	describe("invalid values", () => {
+		test("warns on invalid context management level", () => {
+			const result = parseArgs(["--context-management-level", "turbo"]);
+			expect(result.contextManagementLevel).toBeUndefined();
+			expect(result.diagnostics).toContainEqual(
+				expect.objectContaining({
+					type: "warning",
+					message: expect.stringContaining('Invalid context management level "turbo"'),
+				}),
+			);
+		});
 	});
 
 	describe("--no-session flag", () => {

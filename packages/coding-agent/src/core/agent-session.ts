@@ -36,7 +36,9 @@ import {
 	collectEntriesForBranchSummary,
 	compact,
 	estimateContextTokens,
+	estimateToolResultChars,
 	generateBranchSummary,
+	microCompact,
 	prepareCompaction,
 	shouldCompact,
 } from "./compaction/index.js";
@@ -252,6 +254,7 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
+	private _inLoopCompactionFailures = 0;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -384,10 +387,58 @@ export class AgentSession {
 			}
 		};
 
+		const baseTransformContext = this.agent.transformContext;
+		this.agent.transformContext = async (messages, signal) => {
+			const transformed = baseTransformContext ? await baseTransformContext(messages, signal) : messages;
+			return this._applyRuntimeContextManagement(transformed, signal);
+		};
+
 		this.agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
+			const runtimeSettings = this.settingsManager.getRuntimeContextManagementSettings();
+			let effectiveResult = result;
+			if (!isError && runtimeSettings.truncateToolResults && runtimeSettings.maxToolResultChars > 0) {
+				const totalChars = result.content.reduce(
+					(sum, block) => sum + (block.type === "text" ? block.text.length : 0),
+					0,
+				);
+				if (totalChars > runtimeSettings.maxToolResultChars) {
+					let remaining = runtimeSettings.maxToolResultChars;
+					const newContent: typeof result.content = [];
+					for (const block of result.content) {
+						if (block.type !== "text") {
+							newContent.push(block);
+							continue;
+						}
+						if (remaining <= 0) {
+							continue;
+						}
+						if (block.text.length <= remaining) {
+							newContent.push(block);
+							remaining -= block.text.length;
+						} else {
+							newContent.push({ type: "text", text: block.text.slice(0, remaining) });
+							remaining = 0;
+						}
+					}
+					newContent.push({
+						type: "text",
+						text: `\n[...truncated, ${totalChars - runtimeSettings.maxToolResultChars} chars omitted]`,
+					});
+					effectiveResult = {
+						content: newContent,
+						details: result.details,
+					};
+				}
+			}
+
 			const runner = this._extensionRunner;
 			if (!runner?.hasHandlers("tool_result")) {
-				return undefined;
+				return effectiveResult !== result
+					? {
+							content: effectiveResult.content,
+							details: effectiveResult.details,
+						}
+					: undefined;
 			}
 
 			const hookResult = await runner.emitToolResult({
@@ -395,13 +446,18 @@ export class AgentSession {
 				toolName: toolCall.name,
 				toolCallId: toolCall.id,
 				input: args as Record<string, unknown>,
-				content: result.content,
-				details: isError ? undefined : result.details,
+				content: effectiveResult.content,
+				details: isError ? undefined : effectiveResult.details,
 				isError,
 			});
 
 			if (!hookResult || isError) {
-				return undefined;
+				return effectiveResult !== result
+					? {
+							content: effectiveResult.content,
+							details: effectiveResult.details,
+						}
+					: undefined;
 			}
 
 			return {
@@ -409,6 +465,95 @@ export class AgentSession {
 				details: hookResult.details,
 			};
 		};
+	}
+
+	private async _applyRuntimeContextManagement(
+		messages: AgentMessage[],
+		signal?: AbortSignal,
+	): Promise<AgentMessage[]> {
+		const runtimeSettings = this.settingsManager.getRuntimeContextManagementSettings();
+		if (!runtimeSettings.microCompact && !runtimeSettings.inLoopCompaction) {
+			return messages;
+		}
+		if (
+			runtimeSettings.inLoopCompaction &&
+			this._inLoopCompactionFailures >= runtimeSettings.inLoopCompactionFailureLimit
+		) {
+			return messages;
+		}
+
+		const settings = this.settingsManager.getCompactionSettings();
+		if (!settings.enabled) return messages;
+
+		const contextWindow = this.model?.contextWindow ?? 0;
+		if (contextWindow <= 0) return messages;
+
+		let candidateMessages = messages;
+		try {
+			if (runtimeSettings.microCompact) {
+				const toolResultChars = estimateToolResultChars(candidateMessages);
+				if (toolResultChars > runtimeSettings.microCompactMinToolResultChars) {
+					const microCompacted = microCompact(candidateMessages, runtimeSettings.microCompactKeepTurns);
+					if (microCompacted !== candidateMessages) {
+						candidateMessages = microCompacted;
+						if (!runtimeSettings.inLoopCompaction) {
+							return candidateMessages;
+						}
+
+						const microEstimate = estimateContextTokens(candidateMessages);
+						if (!shouldCompact(microEstimate.tokens, contextWindow, settings)) {
+							this._inLoopCompactionFailures = 0;
+							return candidateMessages;
+						}
+					}
+				}
+			}
+
+			if (!runtimeSettings.inLoopCompaction) {
+				return candidateMessages;
+			}
+
+			const estimate = estimateContextTokens(candidateMessages);
+			if (!shouldCompact(estimate.tokens, contextWindow, settings)) {
+				return candidateMessages;
+			}
+
+			if (!this.model) return candidateMessages;
+			const { apiKey, headers } = await this._getRequiredRequestAuth(this.model);
+
+			const pathEntries = this.sessionManager.getBranch();
+			const preparation = prepareCompaction(pathEntries, settings);
+			if (!preparation) return candidateMessages;
+
+			this._emit({ type: "compaction_start", reason: "threshold" });
+			const compactResult = await compact(preparation, this.model, apiKey, headers, undefined, signal);
+
+			this.sessionManager.appendCompaction(
+				compactResult.summary,
+				compactResult.firstKeptEntryId,
+				compactResult.tokensBefore,
+				compactResult.details,
+				false,
+			);
+			const sessionContext = this.sessionManager.buildSessionContext();
+			this.agent.state.messages = sessionContext.messages;
+			this._emit({
+				type: "compaction_end",
+				reason: "threshold",
+				result: compactResult,
+				aborted: false,
+				willRetry: false,
+			});
+
+			this._overflowRecoveryAttempted = false;
+			this._inLoopCompactionFailures = 0;
+			return sessionContext.messages;
+		} catch {
+			if (runtimeSettings.inLoopCompaction) {
+				this._inLoopCompactionFailures++;
+			}
+			return candidateMessages;
+		}
 	}
 
 	// =========================================================================
@@ -486,6 +631,7 @@ export class AgentSession {
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempted = false;
+			this._inLoopCompactionFailures = 0;
 			const messageText = this._getUserMessageText(event.message);
 			if (messageText) {
 				// Check steering queue first

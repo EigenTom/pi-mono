@@ -22,6 +22,8 @@ Pi has two summarization mechanisms:
 
 Both use the same structured summary format and track file operations cumulatively.
 
+Pi also has a separate runtime context-management layer for long tool-heavy runs. Unlike compaction entries written to the session file, these controls rewrite the live message array before the next model call.
+
 ## Compaction
 
 ### When It Triggers
@@ -143,6 +145,38 @@ interface CompactionDetails {
 Extensions can store any JSON-serializable data in `details`. The default compaction tracks file operations, but custom extension implementations can use their own structure.
 
 See [`prepareCompaction()`](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) and [`compact()`](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) for the implementation.
+
+## Runtime Context Management
+
+Before full compaction runs, pi can optionally reduce context pressure in three lighter-weight ways:
+
+1. Truncate a single oversized tool result before it enters the next model call.
+2. Micro-compact older tool results in memory by replacing them with `[cleared]`.
+3. Run inline compaction during the agent loop instead of waiting for overflow recovery or the next end-of-turn check.
+
+This layer is controlled by `runtimeContextManagement` settings or the CLI flag `--context-management-level`.
+
+### Profiles
+
+| Level | Behavior |
+|-------|----------|
+| `current` / `level0` | Current upstream behavior. No tool-result truncation or micro-compaction. |
+| `level1` | Only truncate very large tool results. |
+| `level2` | Same as `level1`, but with a stricter truncation cap. |
+| `level3` | Truncation plus micro-compaction. No inline full compaction. |
+| `legacy` / `level4` | Restores the older behavior: truncation, micro-compaction, and inline compaction. |
+| `level5` | Most aggressive profile. Smaller truncation cap, earlier micro-compaction, fewer recent turns kept. |
+
+Use `legacy` when you want behavior close to the older `pi-mono` runtime, and use `level0`-`level5` for controlled ablations.
+
+### CLI
+
+```bash
+pi --context-management-level legacy
+pi --context-management-level level3
+```
+
+`--runtime-context-level` is an alias for the same setting.
 
 ## Branch Summarization
 
@@ -392,3 +426,30 @@ Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settin
 | `keepRecentTokens` | `20000` | Recent tokens to keep (not summarized) |
 
 Disable auto-compaction with `"enabled": false`. You can still compact manually with `/compact`.
+
+Runtime context management can be configured alongside compaction:
+
+```json
+{
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 16384,
+    "keepRecentTokens": 20000
+  },
+  "runtimeContextManagement": {
+    "level": "legacy"
+  }
+}
+```
+
+You can also override individual fields if you want a custom profile:
+
+```json
+{
+  "runtimeContextManagement": {
+    "level": "level5",
+    "maxToolResultChars": 8000,
+    "microCompactKeepTurns": 4
+  }
+}
+```

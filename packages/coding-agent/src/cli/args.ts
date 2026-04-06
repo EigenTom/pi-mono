@@ -6,6 +6,7 @@ import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import chalk from "chalk";
 import { APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR } from "../config.js";
 import type { ExtensionFlag } from "../core/extensions/types.js";
+import { isRuntimeContextManagementLevel, type RuntimeContextManagementLevel } from "../core/settings-manager.js";
 import { allTools, type ToolName } from "../core/tools/index.js";
 
 export type Mode = "text" | "json" | "rpc";
@@ -17,6 +18,7 @@ export interface Args {
 	systemPrompt?: string;
 	appendSystemPrompt?: string;
 	thinking?: ThinkingLevel;
+	contextManagementLevel?: RuntimeContextManagementLevel;
 	continue?: boolean;
 	resume?: boolean;
 	help?: boolean;
@@ -125,6 +127,18 @@ export function parseArgs(args: string[]): Args {
 					message: `Invalid thinking level "${level}". Valid values: ${VALID_THINKING_LEVELS.join(", ")}`,
 				});
 			}
+		} else if ((arg === "--context-management-level" || arg === "--runtime-context-level") && i + 1 < args.length) {
+			const level = args[++i];
+			if (isRuntimeContextManagementLevel(level)) {
+				result.contextManagementLevel = level;
+			} else {
+				result.diagnostics.push({
+					type: "warning",
+					message:
+						`Invalid context management level "${level}". ` +
+						"Valid values: current, legacy, level0, level1, level2, level3, level4, level5",
+				});
+			}
 		} else if (arg === "--print" || arg === "-p") {
 			result.print = true;
 		} else if (arg === "--export" && i + 1 < args.length) {
@@ -231,6 +245,10 @@ ${chalk.bold("Options:")}
   --tools <tools>                Comma-separated list of tools to enable (default: read,bash,edit,write)
                                  Available: read, bash, edit, write, grep, find, ls
   --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh
+  --context-management-level <level>
+                                 Runtime context profile: current, legacy, level0-level5
+  --runtime-context-level <level>
+                                 Alias for --context-management-level
   --extension, -e <path>         Load an extension file (can be used multiple times)
   --no-extensions, -ne           Disable extension discovery (explicit -e paths still work)
   --skill <path>                 Load a skill file or directory (can be used multiple times)

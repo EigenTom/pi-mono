@@ -242,6 +242,17 @@ Long sessions can exhaust context windows. Compaction summarizes older messages 
 
 **Automatic:** Enabled by default. Triggers on context overflow (recovers and retries) or when approaching the limit (proactive). Configure via `/settings` or `settings.json`.
 
+Pi also supports runtime context-management profiles for tool-heavy runs. These profiles change what the model actually sees before the next call:
+
+- `current` / `level0`: current upstream behavior, only full compaction
+- `level1`: truncate very large tool results
+- `level2`: stricter tool-result truncation
+- `level3`: truncation plus micro-compaction
+- `legacy` / `level4`: restores the older runtime behavior with truncation, micro-compaction, and in-loop compaction
+- `level5`: most aggressive runtime profile
+
+Select a profile with `--context-management-level <level>` or `--runtime-context-level <level>`.
+
 Compaction is lossy. The full history remains in the JSONL file; use `/tree` to revisit. Customize compaction behavior via [extensions](#extensions). See [docs/compaction.md](docs/compaction.md) for internals.
 
 ---
@@ -485,6 +496,8 @@ cat README.md | pi -p "Summarize this text"
 | `--api-key <key>` | API key (overrides env vars) |
 | `--thinking <level>` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh` |
 | `--models <patterns>` | Comma-separated patterns for Ctrl+P cycling |
+| `--context-management-level <level>` | Runtime context profile: `current`, `legacy`, `level0`-`level5` |
+| `--runtime-context-level <level>` | Alias for `--context-management-level` |
 | `--list-models [search]` | List available models |
 
 ### Session Options
@@ -571,6 +584,12 @@ pi --tools read,grep,find,ls -p "Review the code"
 
 # High thinking level
 pi --thinking high "Solve this complex problem"
+
+# Restore older runtime context management
+pi --context-management-level legacy
+
+# Run the strongest runtime ablation profile
+pi --context-management-level level5 -p "Summarize this repository"
 ```
 
 ### Environment Variables

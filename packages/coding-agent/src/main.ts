@@ -485,6 +485,13 @@ export async function main(args: string[]) {
 			},
 		});
 		const { settingsManager, modelRegistry, resourceLoader } = services;
+		if (parsed.contextManagementLevel) {
+			settingsManager.applyOverrides({
+				runtimeContextManagement: {
+					level: parsed.contextManagementLevel,
+				},
+			});
+		}
 		const diagnostics: AgentSessionRuntimeDiagnostic[] = [
 			...services.diagnostics,
 			...collectSettingsDiagnostics(settingsManager, "runtime creation"),

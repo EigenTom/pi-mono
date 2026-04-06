@@ -10,6 +10,38 @@ export interface CompactionSettings {
 	keepRecentTokens?: number; // default: 20000
 }
 
+export type RuntimeContextManagementLevel =
+	| "current"
+	| "legacy"
+	| "level0"
+	| "level1"
+	| "level2"
+	| "level3"
+	| "level4"
+	| "level5";
+
+export interface RuntimeContextManagementSettings {
+	level?: RuntimeContextManagementLevel;
+	truncateToolResults?: boolean;
+	maxToolResultChars?: number;
+	microCompact?: boolean;
+	microCompactKeepTurns?: number;
+	microCompactMinToolResultChars?: number;
+	inLoopCompaction?: boolean;
+	inLoopCompactionFailureLimit?: number;
+}
+
+export interface ResolvedRuntimeContextManagementSettings {
+	level: RuntimeContextManagementLevel;
+	truncateToolResults: boolean;
+	maxToolResultChars: number;
+	microCompact: boolean;
+	microCompactKeepTurns: number;
+	microCompactMinToolResultChars: number;
+	inLoopCompaction: boolean;
+	inLoopCompactionFailureLimit: number;
+}
+
 export interface BranchSummarySettings {
 	reserveTokens?: number; // default: 16384 (tokens reserved for prompt + LLM response)
 	skipPrompt?: boolean; // default: false - when true, skips "Summarize branch?" prompt and defaults to no summary
@@ -70,6 +102,7 @@ export interface Settings {
 	followUpMode?: "all" | "one-at-a-time";
 	theme?: string;
 	compaction?: CompactionSettings;
+	runtimeContextManagement?: RuntimeContextManagementSettings;
 	branchSummary?: BranchSummarySettings;
 	retry?: RetrySettings;
 	hideThinkingBlock?: boolean;
@@ -95,6 +128,107 @@ export interface Settings {
 	showHardwareCursor?: boolean; // Show terminal cursor while still positioning it for IME
 	markdown?: MarkdownSettings;
 	sessionDir?: string; // Custom session storage directory (same format as --session-dir CLI flag)
+}
+
+const RUNTIME_CONTEXT_MANAGEMENT_PROFILES: Record<
+	RuntimeContextManagementLevel,
+	Omit<ResolvedRuntimeContextManagementSettings, "level">
+> = {
+	current: {
+		truncateToolResults: false,
+		maxToolResultChars: 0,
+		microCompact: false,
+		microCompactKeepTurns: 10,
+		microCompactMinToolResultChars: 0,
+		inLoopCompaction: false,
+		inLoopCompactionFailureLimit: 3,
+	},
+	legacy: {
+		truncateToolResults: true,
+		maxToolResultChars: 20_000,
+		microCompact: true,
+		microCompactKeepTurns: 10,
+		microCompactMinToolResultChars: 200_000,
+		inLoopCompaction: true,
+		inLoopCompactionFailureLimit: 3,
+	},
+	level0: {
+		truncateToolResults: false,
+		maxToolResultChars: 0,
+		microCompact: false,
+		microCompactKeepTurns: 10,
+		microCompactMinToolResultChars: 0,
+		inLoopCompaction: false,
+		inLoopCompactionFailureLimit: 3,
+	},
+	level1: {
+		truncateToolResults: true,
+		maxToolResultChars: 50_000,
+		microCompact: false,
+		microCompactKeepTurns: 12,
+		microCompactMinToolResultChars: 0,
+		inLoopCompaction: false,
+		inLoopCompactionFailureLimit: 3,
+	},
+	level2: {
+		truncateToolResults: true,
+		maxToolResultChars: 20_000,
+		microCompact: false,
+		microCompactKeepTurns: 10,
+		microCompactMinToolResultChars: 0,
+		inLoopCompaction: false,
+		inLoopCompactionFailureLimit: 3,
+	},
+	level3: {
+		truncateToolResults: true,
+		maxToolResultChars: 20_000,
+		microCompact: true,
+		microCompactKeepTurns: 12,
+		microCompactMinToolResultChars: 240_000,
+		inLoopCompaction: false,
+		inLoopCompactionFailureLimit: 3,
+	},
+	level4: {
+		truncateToolResults: true,
+		maxToolResultChars: 20_000,
+		microCompact: true,
+		microCompactKeepTurns: 10,
+		microCompactMinToolResultChars: 200_000,
+		inLoopCompaction: true,
+		inLoopCompactionFailureLimit: 3,
+	},
+	level5: {
+		truncateToolResults: true,
+		maxToolResultChars: 10_000,
+		microCompact: true,
+		microCompactKeepTurns: 6,
+		microCompactMinToolResultChars: 60_000,
+		inLoopCompaction: true,
+		inLoopCompactionFailureLimit: 3,
+	},
+};
+
+export function isRuntimeContextManagementLevel(value: string): value is RuntimeContextManagementLevel {
+	return value in RUNTIME_CONTEXT_MANAGEMENT_PROFILES;
+}
+
+export function resolveRuntimeContextManagementSettings(
+	settings?: RuntimeContextManagementSettings,
+): ResolvedRuntimeContextManagementSettings {
+	const requestedLevel = settings?.level ?? "current";
+	const level: RuntimeContextManagementLevel = requestedLevel === "current" ? "level0" : requestedLevel;
+	const base = RUNTIME_CONTEXT_MANAGEMENT_PROFILES[requestedLevel] ?? RUNTIME_CONTEXT_MANAGEMENT_PROFILES.current;
+
+	return {
+		level,
+		truncateToolResults: settings?.truncateToolResults ?? base.truncateToolResults,
+		maxToolResultChars: settings?.maxToolResultChars ?? base.maxToolResultChars,
+		microCompact: settings?.microCompact ?? base.microCompact,
+		microCompactKeepTurns: settings?.microCompactKeepTurns ?? base.microCompactKeepTurns,
+		microCompactMinToolResultChars: settings?.microCompactMinToolResultChars ?? base.microCompactMinToolResultChars,
+		inLoopCompaction: settings?.inLoopCompaction ?? base.inLoopCompaction,
+		inLoopCompactionFailureLimit: settings?.inLoopCompactionFailureLimit ?? base.inLoopCompactionFailureLimit,
+	};
 }
 
 /** Deep merge settings: project/overrides take precedence, nested objects merge recursively */
@@ -641,6 +775,10 @@ export class SettingsManager {
 			reserveTokens: this.getCompactionReserveTokens(),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(),
 		};
+	}
+
+	getRuntimeContextManagementSettings(): ResolvedRuntimeContextManagementSettings {
+		return resolveRuntimeContextManagementSettings(this.settings.runtimeContextManagement);
 	}
 
 	getBranchSummarySettings(): { reserveTokens: number; skipPrompt: boolean } {

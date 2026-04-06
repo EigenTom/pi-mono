@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { SettingsManager } from "../src/core/settings-manager.js";
+import { resolveRuntimeContextManagementSettings, SettingsManager } from "../src/core/settings-manager.js";
 
 describe("SettingsManager", () => {
 	const testDir = join(process.cwd(), "test-settings-tmp");
@@ -209,6 +209,36 @@ describe("SettingsManager", () => {
 			expect(errors).toHaveLength(2);
 			expect(errors.map((e) => e.scope).sort()).toEqual(["global", "project"]);
 			expect(manager.drainErrors()).toEqual([]);
+		});
+	});
+
+	describe("runtime context management", () => {
+		it("resolves legacy profile to the old runtime behavior", () => {
+			expect(resolveRuntimeContextManagementSettings({ level: "legacy" })).toEqual({
+				level: "legacy",
+				truncateToolResults: true,
+				maxToolResultChars: 20_000,
+				microCompact: true,
+				microCompactKeepTurns: 10,
+				microCompactMinToolResultChars: 200_000,
+				inLoopCompaction: true,
+				inLoopCompactionFailureLimit: 3,
+			});
+		});
+
+		it("allows profile fields to be overridden", () => {
+			expect(
+				resolveRuntimeContextManagementSettings({
+					level: "level5",
+					maxToolResultChars: 1234,
+					microCompactKeepTurns: 2,
+				}),
+			).toMatchObject({
+				level: "level5",
+				maxToolResultChars: 1234,
+				microCompactKeepTurns: 2,
+				microCompact: true,
+			});
 		});
 	});
 
