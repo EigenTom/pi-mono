@@ -1,0 +1,23 @@
+{
+	"providers": {
+		"local-vllm": {
+			"baseUrl": "http://127.0.0.1:8001/v1",
+			"api": "openai-completions",
+			"apiKey": "vllm",
+			"compat": {
+				"supportsDeveloperRole": false,
+				"supportsReasoningEffort": false,
+				"thinkingFormat": "qwen-chat-template"
+			},
+			"models": [
+				{
+					"id": "qwen3-8b",
+					"name": "Qwen3 8B (local vLLM)",
+					"reasoning": true,
+					"contextWindow": 32768,
+					"maxTokens": 4096
+				}
+			]
+		}
+	}
+}

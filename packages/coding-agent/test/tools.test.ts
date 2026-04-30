@@ -1,9 +1,11 @@
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { executeBash } from "../src/core/bash-executor.js";
 import { bashTool, createBashTool, createLocalBashOperations } from "../src/core/tools/bash.js";
+import { createDenseFilterTool } from "../src/core/tools/dense_filter.js";
+import { createDenseRetrieveTool } from "../src/core/tools/dense_retrieve.js";
 import { editTool } from "../src/core/tools/edit.js";
 import { findTool } from "../src/core/tools/find.js";
 import { grepTool } from "../src/core/tools/grep.js";
@@ -799,5 +801,318 @@ describe("edit tool CRLF handling", () => {
 
 		const content = readFileSync(testFile, "utf-8");
 		expect(content).toBe("\uFEFFfirst\r\nSECOND\r\nthird\r\nFOURTH\r\n");
+	});
+});
+
+describe("dense_retriever tool", () => {
+	it("should make request with default top_k", async () => {
+		const mockResults = [
+			{ doc_path: "docs/api.md", score: 0.95 },
+			{ doc_path: "docs/guide.md", score: 0.87 },
+		];
+
+		const mockFetch = vi.fn().mockResolvedValueOnce({
+			ok: true,
+			json: async () => ({ results: mockResults }),
+		});
+
+		const tool = createDenseRetrieveTool({
+			baseUrl: "http://test-server:8000/retrieve",
+			operations: { fetch: mockFetch },
+		});
+
+		const result = await tool.execute("test-call-1", { query: "python tutorial" });
+		const output = getTextOutput(result);
+
+		expect(mockFetch).toHaveBeenCalledWith("http://test-server:8000/retrieve", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ query: "python tutorial", top_k: 10 }),
+			signal: undefined,
+		});
+
+		expect(output).toContain("docs/api.md");
+		expect(output).toContain("0.9500");
+		expect(output).toContain("docs/guide.md");
+		expect(output).toContain("0.8700");
+	});
+
+	it("should respect custom top_k parameter", async () => {
+		const mockFetch = vi.fn().mockResolvedValueOnce({
+			ok: true,
+			json: async () => ({ results: [] }),
+		});
+
+		const tool = createDenseRetrieveTool({
+			operations: { fetch: mockFetch },
+		});
+
+		await tool.execute("test-call-2", { query: "test", top_k: 10 });
+
+		expect(mockFetch).toHaveBeenCalledWith(
+			expect.any(String),
+			expect.objectContaining({
+				body: expect.stringContaining('"top_k":10'),
+			}),
+		);
+	});
+
+	it("should handle empty results", async () => {
+		const mockFetch = vi.fn().mockResolvedValueOnce({
+			ok: true,
+			json: async () => ({ results: [] }),
+		});
+
+		const tool = createDenseRetrieveTool({
+			operations: { fetch: mockFetch },
+		});
+
+		const result = await tool.execute("test-call-3", { query: "nonexistent" });
+		const output = getTextOutput(result);
+
+		expect(output).toBe("No relevant documents found.");
+	});
+
+	it("should handle API errors", async () => {
+		const mockFetch = vi.fn().mockResolvedValueOnce({
+			ok: false,
+			status: 500,
+			statusText: "Internal Server Error",
+			text: async () => "Service unavailable",
+		});
+
+		const tool = createDenseRetrieveTool({
+			operations: { fetch: mockFetch },
+		});
+
+		await expect(tool.execute("test-call-4", { query: "test" })).rejects.toThrow(
+			/Dense Retriever API error: 500 Internal Server Error/,
+		);
+	});
+
+	it("should include details in result", async () => {
+		const mockResults = [{ doc_path: "test.md", score: 0.99 }];
+
+		const mockFetch = vi.fn().mockResolvedValueOnce({
+			ok: true,
+			json: async () => ({ results: mockResults }),
+		});
+
+		const tool = createDenseRetrieveTool({
+			operations: { fetch: mockFetch },
+		});
+
+		const result = await tool.execute("test-call-5", { query: "test", top_k: 3 });
+
+		expect(result.details).toEqual({
+			query: "test",
+			topK: 3,
+			results: mockResults,
+		});
+	});
+
+	it("should format results with score precision", async () => {
+		const mockResults = [
+			{ doc_path: "doc1.md", score: 0.123456 },
+			{ doc_path: "doc2.md", score: 0.987654 },
+		];
+
+		const mockFetch = vi.fn().mockResolvedValueOnce({
+			ok: true,
+			json: async () => ({ results: mockResults }),
+		});
+
+		const tool = createDenseRetrieveTool({
+			operations: { fetch: mockFetch },
+		});
+
+		const result = await tool.execute("test-call-6", { query: "test" });
+		const output = getTextOutput(result);
+
+		expect(output).toContain("0.1235");
+		expect(output).toContain("0.9877");
+	});
+
+	it("should not send signal in execute if not provided", async () => {
+		const mockFetch = vi.fn().mockResolvedValueOnce({
+			ok: true,
+			json: async () => ({ results: [] }),
+		});
+
+		const tool = createDenseRetrieveTool({
+			operations: { fetch: mockFetch },
+		});
+
+		await tool.execute("test-call-7", { query: "test" });
+
+		const callArgs = mockFetch.mock.calls[0];
+		expect(callArgs[1].signal).toBeUndefined();
+	});
+
+	it("should timeout slow requests", async () => {
+		vi.useFakeTimers();
+		try {
+			const mockFetch = vi.fn((_url: string, options: any) => {
+				return new Promise((_resolve, reject) => {
+					options.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+				});
+			});
+
+			const tool = createDenseRetrieveTool({
+				timeout: 1,
+				operations: { fetch: mockFetch as any },
+			});
+
+			const execution = tool.execute("test-call-8", { query: "slow query" });
+			const assertion = expect(execution).rejects.toThrow(/timed out after 1 seconds/);
+			await vi.advanceTimersByTimeAsync(1000);
+			await assertion;
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+});
+
+describe("dense_filter tool", () => {
+	let filterTestDir: string;
+
+	beforeEach(() => {
+		filterTestDir = join(tmpdir(), `coding-agent-filter-test-${Date.now()}`);
+		mkdirSync(filterTestDir, { recursive: true });
+	});
+
+	afterEach(() => {
+		rmSync(filterTestDir, { recursive: true, force: true });
+	});
+
+	function jsonResponse(payload: unknown) {
+		return {
+			ok: true,
+			json: async () => payload,
+		} as any;
+	}
+
+	it("filters multiple semantic queries into a short agent-facing status and manifest", async () => {
+		const mockFetch = vi
+			.fn()
+			.mockResolvedValueOnce(
+				jsonResponse({
+					results: [
+						{ docid: "1", doc_path: "docs/a.txt", score: 10 },
+						{ docid: "2", doc_path: "docs/b.txt", score: 9 },
+					],
+				}),
+			)
+			.mockResolvedValueOnce(
+				jsonResponse({
+					results: [
+						{ docid: "2", doc_path: "docs/b.txt", score: 12 },
+						{ docid: "3", doc_path: "docs/c.txt", score: 8 },
+					],
+				}),
+			);
+
+		const tool = createDenseFilterTool(filterTestDir, {
+			baseUrl: "http://test-server:8000/retrieve",
+			topKPerQuery: 2,
+			maxDocuments: 10,
+			operations: { fetch: mockFetch },
+		});
+
+		const result = await tool.execute("filter-call-1", {
+			queries: ["Eiffel Tower capital", "Paris landmark"],
+		});
+		const output = getTextOutput(result);
+
+		expect(output).toBe(
+			"Corpus filter state has been updated. Continue searching the current corpus with bash, rg, find, ls, and read.",
+		);
+		expect(output).not.toContain("3 documents");
+		expect(output).not.toContain("2 queries");
+		expect(output).not.toContain("docs/a.txt");
+		expect(mockFetch).toHaveBeenCalledTimes(2);
+		expect(mockFetch).toHaveBeenNthCalledWith(
+			1,
+			"http://test-server:8000/retrieve",
+			expect.objectContaining({
+				body: JSON.stringify({ query: "Eiffel Tower capital", top_k: 2 }),
+			}),
+		);
+
+		expect(result.details?.visibleDocumentCount).toBe(3);
+		expect(result.details?.perQueryHitCounts).toEqual({
+			"Eiffel Tower capital": 2,
+			"Paris landmark": 2,
+		});
+		expect(JSON.stringify(result.details)).not.toContain("visibleDocuments");
+
+		const manifest = JSON.parse(readFileSync(result.details?.manifestPath, "utf-8"));
+		expect(manifest.visible_documents.map((doc: any) => doc.doc_path)).toEqual([
+			"docs/b.txt",
+			"docs/a.txt",
+			"docs/c.txt",
+		]);
+		expect(manifest.visible_documents[0].queries).toEqual(["Eiffel Tower capital", "Paris landmark"]);
+	});
+
+	it("can materialize and refresh the filtered view with hardlinks when configured by the harness", async () => {
+		const sourceRoot = join(filterTestDir, "source");
+		const viewDir = join(filterTestDir, "view");
+		mkdirSync(join(sourceRoot, "docs"), { recursive: true });
+		mkdirSync(viewDir, { recursive: true });
+		writeFileSync(join(sourceRoot, "docs", "a.txt"), "alpha");
+		writeFileSync(join(sourceRoot, "docs", "b.txt"), "beta");
+		writeFileSync(join(sourceRoot, "docs", "c.txt"), "gamma");
+
+		const mockFetch = vi
+			.fn()
+			.mockResolvedValueOnce(
+				jsonResponse({
+					results: [
+						{ docid: "1", doc_path: "docs/a.txt", score: 10 },
+						{ docid: "2", doc_path: "docs/b.txt", score: 9 },
+					],
+				}),
+			)
+			.mockResolvedValueOnce(
+				jsonResponse({
+					results: [{ docid: "3", doc_path: "docs/c.txt", score: 11 }],
+				}),
+			);
+
+		const tool = createDenseFilterTool(viewDir, {
+			baseUrl: "http://test-server:8000/retrieve",
+			topKPerQuery: 2,
+			viewMode: "hardlink",
+			sourceRoot,
+			operations: { fetch: mockFetch },
+		});
+
+		const result = await tool.execute("filter-call-2", { queries: ["alpha beta"] });
+
+		const sourceStat = statSync(join(sourceRoot, "docs", "a.txt"));
+		const targetStat = statSync(join(viewDir, "docs", "a.txt"));
+		expect(targetStat.ino).toBe(sourceStat.ino);
+		expect(targetStat.dev).toBe(sourceStat.dev);
+		expect(readFileSync(join(viewDir, "docs", "b.txt"), "utf-8")).toBe("beta");
+		expect(result.details?.materialized?.createdCount).toBe(2);
+		expect(result.details?.materialized?.missingCount).toBe(0);
+		expect(existsSync(join(viewDir, ".dci_filter", "managed_paths.json"))).toBe(true);
+
+		const refreshed = await tool.execute("filter-call-3", { queries: ["gamma"] });
+		const refreshedSourceStat = statSync(join(sourceRoot, "docs", "c.txt"));
+		const refreshedTargetStat = statSync(join(viewDir, "docs", "c.txt"));
+
+		expect(refreshed.details?.visibleDocumentCount).toBe(1);
+		expect(refreshed.details?.materialized?.createdCount).toBe(1);
+		expect(refreshed.details?.materialized?.missingCount).toBe(0);
+		expect(refreshedTargetStat.ino).toBe(refreshedSourceStat.ino);
+		expect(readFileSync(join(viewDir, "docs", "c.txt"), "utf-8")).toBe("gamma");
+		expect(existsSync(join(viewDir, "docs", "a.txt"))).toBe(false);
+		expect(existsSync(join(viewDir, "docs", "b.txt"))).toBe(false);
+		expect(readFileSync(join(sourceRoot, "docs", "a.txt"), "utf-8")).toBe("alpha");
+
+		const managedPaths = JSON.parse(readFileSync(join(viewDir, ".dci_filter", "managed_paths.json"), "utf-8"));
+		expect(managedPaths).toEqual(["docs/c.txt"]);
 	});
 });

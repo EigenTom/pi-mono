@@ -12,6 +12,25 @@ export {
 	createLocalBashOperations,
 } from "./bash.js";
 export {
+	createDenseFilterTool,
+	createDenseFilterToolDefinition,
+	type DenseFilterOperations,
+	type DenseFilterToolDetails,
+	type DenseFilterToolInput,
+	type DenseFilterToolOptions,
+	type DenseFilterViewMode,
+} from "./dense_filter.js";
+export {
+	createDenseRetrieveTool,
+	createDenseRetrieveToolDefinition,
+	type DenseRetrieveOperations,
+	type DenseRetrieveToolDetails,
+	type DenseRetrieveToolInput,
+	type DenseRetrieveToolOptions,
+	denseRetrieveTool,
+	denseRetrieveToolDefinition,
+} from "./dense_retrieve.js";
+export {
 	createEditTool,
 	createEditToolDefinition,
 	type EditOperations,
@@ -91,6 +110,13 @@ import {
 	createBashTool,
 	createBashToolDefinition,
 } from "./bash.js";
+import { createDenseFilterTool, createDenseFilterToolDefinition } from "./dense_filter.js";
+import {
+	createDenseRetrieveTool,
+	createDenseRetrieveToolDefinition,
+	denseRetrieveTool,
+	denseRetrieveToolDefinition,
+} from "./dense_retrieve.js";
 import { createEditTool, createEditToolDefinition, editTool, editToolDefinition } from "./edit.js";
 import { createFindTool, createFindToolDefinition, findTool, findToolDefinition } from "./find.js";
 import { createGrepTool, createGrepToolDefinition, grepTool, grepToolDefinition } from "./grep.js";
@@ -107,7 +133,7 @@ import { createWriteTool, createWriteToolDefinition, writeTool, writeToolDefinit
 export type Tool = AgentTool<any>;
 export type ToolDef = ToolDefinition<any, any>;
 
-export const codingTools: Tool[] = [readTool, bashTool, editTool, writeTool];
+export const codingTools: Tool[] = [readTool, bashTool, editTool, writeTool, denseRetrieveTool];
 export const readOnlyTools: Tool[] = [readTool, grepTool, findTool, lsTool];
 
 export const allTools = {
@@ -118,6 +144,9 @@ export const allTools = {
 	grep: grepTool,
 	find: findTool,
 	ls: lsTool,
+	dense_retrieve: denseRetrieveTool,
+	filter: createDenseFilterTool(process.cwd(), { toolName: "filter" }),
+	dense_filter: createDenseFilterTool(process.cwd()),
 };
 
 export const allToolDefinitions = {
@@ -128,6 +157,9 @@ export const allToolDefinitions = {
 	grep: grepToolDefinition,
 	find: findToolDefinition,
 	ls: lsToolDefinition,
+	dense_retrieve: denseRetrieveToolDefinition,
+	filter: createDenseFilterToolDefinition(process.cwd(), { toolName: "filter" }),
+	dense_filter: createDenseFilterToolDefinition(process.cwd()),
 };
 
 export type ToolName = keyof typeof allTools;
@@ -143,6 +175,8 @@ export function createCodingToolDefinitions(cwd: string, options?: ToolsOptions)
 		createBashToolDefinition(cwd, options?.bash),
 		createEditToolDefinition(cwd),
 		createWriteToolDefinition(cwd),
+		createDenseRetrieveToolDefinition(),
+		createDenseFilterToolDefinition(cwd),
 	];
 }
 
@@ -164,6 +198,9 @@ export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): R
 		grep: createGrepToolDefinition(cwd),
 		find: createFindToolDefinition(cwd),
 		ls: createLsToolDefinition(cwd),
+		dense_retrieve: createDenseRetrieveToolDefinition(),
+		filter: createDenseFilterToolDefinition(cwd, { toolName: "filter" }),
+		dense_filter: createDenseFilterToolDefinition(cwd),
 	};
 }
 
@@ -173,6 +210,8 @@ export function createCodingTools(cwd: string, options?: ToolsOptions): Tool[] {
 		createBashTool(cwd, options?.bash),
 		createEditTool(cwd),
 		createWriteTool(cwd),
+		createDenseRetrieveTool(),
+		createDenseFilterTool(cwd),
 	];
 }
 
@@ -189,5 +228,8 @@ export function createAllTools(cwd: string, options?: ToolsOptions): Record<Tool
 		grep: createGrepTool(cwd),
 		find: createFindTool(cwd),
 		ls: createLsTool(cwd),
+		dense_retrieve: createDenseRetrieveTool(),
+		filter: createDenseFilterTool(cwd, { toolName: "filter" }),
+		dense_filter: createDenseFilterTool(cwd),
 	};
 }
