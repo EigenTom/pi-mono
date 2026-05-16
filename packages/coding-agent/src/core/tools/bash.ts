@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { createWriteStream, existsSync } from "node:fs";
+import { createWriteStream, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
@@ -12,9 +12,18 @@ import { theme } from "../../modes/interactive/theme/theme.js";
 import { waitForChildProcess } from "../../utils/child-process.js";
 import { getShellConfig, getShellEnv, killProcessTree } from "../../utils/shell.js";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.js";
+import { recordBudgetEvent } from "./budget-gate.js";
 import { getTextOutput, invalidArgText, str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult, truncateTail } from "./truncate.js";
+import {
+	BASH_MAX_LINE_LENGTH,
+	clampLongLines,
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
+	formatSize,
+	type TruncationResult,
+	truncateTail,
+} from "./truncate.js";
 
 /**
  * Generate a unique temp file path for bash output.
@@ -26,10 +35,16 @@ function getTempFilePath(): string {
 
 const bashSchema = Type.Object({
 	command: Type.String({ description: "Bash command to execute" }),
-	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
 });
 
 export type BashToolInput = Static<typeof bashSchema>;
+
+function getDefaultBashTimeout(): number | undefined {
+	const raw = process.env.DCI_BASH_DEFAULT_TIMEOUT_SECONDS;
+	if (!raw) return undefined;
+	const parsed = Number(raw);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
 
 export interface BashToolDetails {
 	truncation?: TruncationResult;
@@ -175,12 +190,10 @@ function formatDuration(ms: number): string {
 	return `${(ms / 1000).toFixed(1)}s`;
 }
 
-function formatBashCall(args: { command?: string; timeout?: number } | undefined): string {
+function formatBashCall(args: { command?: string } | undefined): string {
 	const command = str(args?.command);
-	const timeout = args?.timeout as number | undefined;
-	const timeoutSuffix = timeout ? theme.fg("muted", ` (timeout ${timeout}s)`) : "";
 	const commandDisplay = command === null ? invalidArgText(theme) : command ? command : theme.fg("toolOutput", "...");
-	return theme.fg("toolTitle", theme.bold(`$ ${commandDisplay}`)) + timeoutSuffix;
+	return theme.fg("toolTitle", theme.bold(`$ ${commandDisplay}`));
 }
 
 function rebuildBashResultRenderComponent(
@@ -269,16 +282,15 @@ export function createBashToolDefinition(
 	return {
 		name: "bash",
 		label: "bash",
-		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.`,
+		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Commands are capped by the harness timeout. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first), and individual long lines are shortened to ${BASH_MAX_LINE_LENGTH} chars. If output is truncated, refine the command or use read with offset/charOffset.`,
 		promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
 		parameters: bashSchema,
-		async execute(
-			_toolCallId,
-			{ command, timeout }: { command: string; timeout?: number },
-			signal?: AbortSignal,
-			onUpdate?,
-			_ctx?,
-		) {
+		async execute(_toolCallId, { command }: { command: string }, signal?: AbortSignal, onUpdate?, _ctx?) {
+			const budget = await recordBudgetEvent(cwd, "bash");
+			if (budget.blocked) {
+				return { content: [{ type: "text", text: budget.blocked }], details: undefined };
+			}
+			const effectiveTimeout = getDefaultBashTimeout() ?? 30;
 			const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
 			const spawnContext = resolveSpawnContext(resolvedCommand, cwd, spawnHook);
 			if (onUpdate) {
@@ -315,7 +327,10 @@ export function createBashToolDefinition(
 					if (onUpdate) {
 						const fullBuffer = Buffer.concat(chunks);
 						const fullText = fullBuffer.toString("utf-8");
-						const truncation = truncateTail(fullText);
+						const lineClamp = clampLongLines(fullText, {
+							command: spawnContext.command,
+						});
+						const truncation = truncateTail(lineClamp.content);
 						onUpdate({
 							content: [{ type: "text", text: truncation.content || "" }],
 							details: {
@@ -329,7 +344,7 @@ export function createBashToolDefinition(
 				ops.exec(spawnContext.command, spawnContext.cwd, {
 					onData: handleData,
 					signal,
-					timeout,
+					timeout: effectiveTimeout,
 					env: spawnContext.env,
 				})
 					.then(({ exitCode }) => {
@@ -339,9 +354,24 @@ export function createBashToolDefinition(
 						const fullBuffer = Buffer.concat(chunks);
 						const fullOutput = fullBuffer.toString("utf-8");
 						// Apply tail truncation for the final display payload.
-						const truncation = truncateTail(fullOutput);
+						const lineClamp = clampLongLines(fullOutput, {
+							command: spawnContext.command,
+						});
+						if (lineClamp.clamped && !tempFilePath) {
+							tempFilePath = getTempFilePath();
+							writeFileSync(tempFilePath, fullOutput);
+						}
+						const truncation = truncateTail(lineClamp.content);
 						let outputText = truncation.content || "(no output)";
-						let details: BashToolDetails | undefined;
+						if (budget.warning) {
+							outputText += `\n\n[${budget.warning}]`;
+						}
+						let details: BashToolDetails | undefined = lineClamp.clamped
+							? { fullOutputPath: tempFilePath }
+							: undefined;
+						if (lineClamp.clamped) {
+							outputText += `\n\n[${lineClamp.clampedLines} long line(s) clipped; full=${tempFilePath}]`;
+						}
 						if (truncation.truncated) {
 							// Build truncation details and an actionable notice.
 							details = { truncation, fullOutputPath: tempFilePath };

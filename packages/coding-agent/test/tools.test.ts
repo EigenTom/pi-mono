@@ -374,10 +374,33 @@ describe("Coding Agent Tools", () => {
 			);
 		});
 
-		it("should respect timeout", async () => {
-			await expect(bashTool.execute("test-call-10", { command: "sleep 5", timeout: 1 })).rejects.toThrow(
-				/timed out/i,
-			);
+		it("should pass the harness timeout to bash operations", async () => {
+			const originalTimeout = process.env.DCI_BASH_DEFAULT_TIMEOUT_SECONDS;
+			process.env.DCI_BASH_DEFAULT_TIMEOUT_SECONDS = "7";
+			try {
+				const exec = vi.fn().mockResolvedValue({ exitCode: 0 });
+				const tool = createBashTool(testDir, {
+					operations: {
+						exec,
+					},
+				});
+
+				await tool.execute("test-call-10", { command: "echo test" });
+
+				expect(exec).toHaveBeenCalledWith(
+					"echo test",
+					testDir,
+					expect.objectContaining({
+						timeout: 7,
+					}),
+				);
+			} finally {
+				if (originalTimeout === undefined) {
+					delete process.env.DCI_BASH_DEFAULT_TIMEOUT_SECONDS;
+				} else {
+					process.env.DCI_BASH_DEFAULT_TIMEOUT_SECONDS = originalTimeout;
+				}
+			}
 		});
 
 		it("should throw error when cwd does not exist", async () => {

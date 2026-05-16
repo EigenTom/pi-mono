@@ -243,7 +243,7 @@ ${chalk.bold("Options:")}
                                  Supports globs (anthropic/*, *sonnet*) and fuzzy matching
   --no-tools                     Disable all built-in tools
   --tools <tools>                Comma-separated list of tools to enable (default: read,bash,edit,write)
-                                 Available: read, bash, edit, write, grep, find, ls, dense_retrieve, dense_filter
+                                 Available: read, bash, edit, write, grep, find, ls, pull
   --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh
   --context-management-level <level>
                                  Runtime context profile: current, legacy, level0-level5
@@ -352,7 +352,6 @@ ${chalk.bold("Available Tools (default: read, bash, edit, write):")}
   grep   - Search file contents (read-only, off by default)
   find   - Find files by glob pattern (read-only, off by default)
   ls     - List directory contents (read-only, off by default)
-  dense_retrieve - Retrieve semantically related corpus documents (off by default)
-  dense_filter   - Filter the corpus view with semantic sub-queries (off by default)
+  pull   - Pull semantically related corpus documents into the visible workspace (off by default)
 `);
 }

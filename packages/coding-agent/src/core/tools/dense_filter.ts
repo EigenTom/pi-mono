@@ -5,7 +5,7 @@
 */
 
 import { link, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, normalize, relative, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, normalize, relative, resolve } from "node:path";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import type { TextContent } from "@mariozechner/pi-ai";
 import { Text } from "@mariozechner/pi-tui";
@@ -37,6 +37,8 @@ type FilteredDocument = {
 	doc_path: string;
 	score: number;
 	queries: string[];
+	sources: Array<{ query: string; queryIndex: number; rank: number }>;
+	bestSource: { query: string; queryIndex: number; rank: number };
 };
 
 export interface DenseFilterToolDetails {
@@ -57,6 +59,7 @@ export interface DenseFilterToolDetails {
 
 // by default we use hardlink. manifest mode (white list mode) needs extra implementation at bash/grep tools' harness level
 export type DenseFilterViewMode = "manifest" | "hardlink";
+type DenseFilterMaterializationMode = "original" | "ranked";
 
 export interface DenseFilterOperations {
 	fetch: (url: string, options: RequestInit) => Promise<Response>;
@@ -90,6 +93,7 @@ export interface DenseFilterToolOptions {
 const FILTER_DIR = ".dci_filter";
 const MANIFEST_FILE = "manifest.json";
 const MANAGED_PATHS_FILE = "managed_paths.json";
+const MANAGED_TARGETS_FILE = "managed_targets.json";
 
 function readPositiveIntEnv(name: string, fallback: number): number {
 	const raw = process.env[name];
@@ -114,6 +118,64 @@ function safeRelativePath(docPath: string): string | undefined {
 	return normalized;
 }
 
+function readMaterializationMode(): DenseFilterMaterializationMode {
+	return process.env.DCI_DENSE_FILTER_MATERIALIZATION_MODE === "ranked" ? "ranked" : "original";
+}
+
+function safePathSegment(value: string): string {
+	const ext = extname(value);
+	const stem = ext ? value.slice(0, -ext.length) : value;
+	const safeStem =
+		stem
+			.toLowerCase()
+			.replace(/[^a-z0-9]+/g, "_")
+			.replace(/^_+|_+$/g, "")
+			.slice(0, 96) || "document";
+	const safeExt = ext
+		.toLowerCase()
+		.replace(/[^a-z0-9.]+/g, "_")
+		.replace(/^_+|_+$/g, "")
+		.slice(0, 20);
+	return safeExt ? `${safeStem}${safeExt.startsWith(".") ? safeExt : `.${safeExt}`}` : safeStem;
+}
+
+function safeRelativeMaterializedPath(safePath: string): string {
+	return safePath
+		.replace(/\\/g, "/")
+		.split("/")
+		.filter(Boolean)
+		.map((segment) => safePathSegment(segment))
+		.join("/");
+}
+
+function rankPrefixedRelativePath(doc: FilteredDocument, safePath: string): string {
+	const baseSafePath = safeRelativeMaterializedPath(safePath);
+	const parent = dirname(baseSafePath);
+	const fileName = basename(baseSafePath);
+	const source = doc.bestSource;
+	const prefixed = `q${source.queryIndex + 1}_${String(source.rank).padStart(4, "0")}__${fileName}`;
+	return parent && parent !== "." ? `${parent}/${prefixed}` : prefixed;
+}
+
+function uniqueRelativePath(path: string, used: Set<string>): string {
+	if (!used.has(path)) {
+		used.add(path);
+		return path;
+	}
+	const parent = dirname(path);
+	const file = basename(path);
+	const ext = extname(file);
+	const stem = ext ? file.slice(0, -ext.length) : file;
+	for (let index = 2; ; index += 1) {
+		const candidateFile = `${stem}__${index}${ext}`;
+		const candidate = parent && parent !== "." ? `${parent}/${candidateFile}` : candidateFile;
+		if (!used.has(candidate)) {
+			used.add(candidate);
+			return candidate;
+		}
+	}
+}
+
 function isInside(parent: string, child: string): boolean {
 	const rel = relative(parent, child);
 	return rel === "" || (!!rel && !rel.startsWith("..") && !isAbsolute(rel));
@@ -130,23 +192,36 @@ async function readJsonArray(path: string, ops: DenseFilterOperations): Promise<
 }
 
 // merge multiple queries' related documents that is retrieved from local dense retriever into a big corpus without duplication
+function betterSource(
+	current: { query: string; queryIndex: number; rank: number },
+	candidate: { query: string; queryIndex: number; rank: number },
+) {
+	if (candidate.rank !== current.rank) return candidate.rank < current.rank ? candidate : current;
+	return candidate.queryIndex < current.queryIndex ? candidate : current;
+}
+
 function mergeResults(queries: string[], perQueryHits: Record<string, RetrieverResult[]>, maxDocuments: number) {
 	const merged = new Map<string, FilteredDocument>();
 
-	for (const query of queries) {
-		for (const hit of perQueryHits[query] ?? []) {
+	for (const [queryIndex, query] of queries.entries()) {
+		for (const [hitIndex, hit] of (perQueryHits[query] ?? []).entries()) {
 			const key = hit.docid ? `docid:${hit.docid}` : `path:${hit.doc_path}`;
 			const existing = merged.get(key);
+			const source = { query, queryIndex, rank: hitIndex + 1 };
 			if (!existing) {
 				merged.set(key, {
 					docid: hit.docid,
 					doc_path: hit.doc_path,
 					score: hit.score,
 					queries: [query],
+					sources: [source],
+					bestSource: source,
 				});
 			} else {
 				existing.score = Math.max(existing.score, hit.score);
 				if (!existing.queries.includes(query)) existing.queries.push(query);
+				existing.sources.push(source);
+				existing.bestSource = betterSource(existing.bestSource, source);
 			}
 		}
 	}
@@ -186,6 +261,7 @@ async function materializeHardlinks(args: {
 	ops: DenseFilterOperations;
 }): Promise<{ created: string[]; missing: string[] }> {
 	const { documents, viewDir, sourceRoot, filterDir, ops } = args;
+	const materializationMode = readMaterializationMode();
 	// Keep the writable view outside the immutable source corpus. This prevents a
 	// stale cleanup pass from unlinking original corpus files by accident.
 	if (isInside(sourceRoot, viewDir) || isInside(viewDir, sourceRoot)) {
@@ -194,7 +270,9 @@ async function materializeHardlinks(args: {
 
 	await ops.mkdir(filterDir);
 	const managedPath = join(filterDir, MANAGED_PATHS_FILE);
-	const previous = await readJsonArray(managedPath, ops);
+	const managedTargetsPath = join(filterDir, MANAGED_TARGETS_FILE);
+	const previousTargets = await readJsonArray(managedTargetsPath, ops);
+	const previous = previousTargets.length > 0 ? previousTargets : await readJsonArray(managedPath, ops);
 	// Only remove paths that this tool previously created in the view. User-created
 	// files, logs, and .dci_filter metadata are left alone.
 	for (const relPath of previous) {
@@ -208,7 +286,9 @@ async function materializeHardlinks(args: {
 	}
 
 	const created: string[] = [];
+	const createdTargets: string[] = [];
 	const missing: string[] = [];
+	const usedTargets = new Set<string>();
 	for (const doc of documents) {
 		const safePath = safeRelativePath(doc.doc_path);
 		if (!safePath) {
@@ -222,7 +302,11 @@ async function materializeHardlinks(args: {
 			continue;
 		}
 
-		const targetPath = resolve(viewDir, safePath);
+		const targetRelPath =
+			materializationMode === "ranked"
+				? uniqueRelativePath(rankPrefixedRelativePath(doc, safePath), usedTargets)
+				: safePath;
+		const targetPath = resolve(viewDir, targetRelPath);
 		if (!isInside(viewDir, targetPath)) {
 			missing.push(doc.doc_path);
 			continue;
@@ -239,22 +323,25 @@ async function materializeHardlinks(args: {
 			// They give bash/rg/read a normal file tree without copying document bytes.
 			await ops.link(sourcePath, targetPath);
 			created.push(safePath);
+			createdTargets.push(targetRelPath);
 		} catch {
 			missing.push(doc.doc_path);
 		}
 	}
 
 	await ops.writeFile(managedPath, JSON.stringify(created, null, 2));
+	await ops.writeFile(managedTargetsPath, JSON.stringify(createdTargets, null, 2));
 	return { created, missing };
 }
 
 function formatDenseFilterCall(
 	args: { queries?: string[] } | undefined,
+	toolName: string,
 	theme: typeof import("../../modes/interactive/theme/theme.js").theme,
 ): string {
 	const count = args?.queries?.length ?? 0;
 	const label = count === 1 ? "1 query" : `${count} queries`;
-	return `${theme.fg("toolTitle", theme.bold("filter"))} ${theme.fg("toolOutput", label)}`;
+	return `${theme.fg("toolTitle", theme.bold(toolName))} ${theme.fg("toolOutput", label)}`;
 }
 
 function formatDenseFilterResult(
@@ -279,22 +366,31 @@ export function createDenseFilterToolDefinition(
 	const viewDir = resolve(cwd, options?.viewDir ?? process.env.DCI_DENSE_FILTER_VIEW_DIR ?? ".");
 	const sourceRoot = options?.sourceRoot ?? process.env.DCI_DENSE_FILTER_SOURCE_ROOT;
 	const toolName = options?.toolName ?? "dense_filter";
+	const agentFacingPull = toolName === "pull";
 	const ops = { ...defaultDenseFilterOperations, ...options?.operations };
 
 	return {
 		name: toolName,
-		label: "Filter Corpus",
-		description:
-			"Remove most semantically unrelated documents from the current benchmark corpus using multiple semantic sub-queries. Updates the current corpus directory and returns only a short status.",
-		promptSnippet:
-			"filter removes most documents that are semantically unrelated to the question from the current corpus directory. After using it, continue normal local search and evidence reading with bash, rg, find, ls, and read.",
-		promptGuidelines: [
-			"Use filter once near the beginning after decomposing a document-retrieval question into focused semantic sub-queries.",
-			"The filter operation removes most semantically unrelated documents from the visible working corpus; it does not answer the question or rank evidence.",
-			"After filter, continue normal DCI-style local exploration with bash, rg, find, ls, and read, starting from rare clue anchors.",
-			// "After filter, treat the current corpus as the corpus and continue ordinary local exploration with shell commands such as bash, rg, etc.",
-			// "Do not answer from the filter status alone; answer only after reading supporting document text.",
-		],
+		label: agentFacingPull ? "Pull Corpus" : "Filter Corpus",
+		description: agentFacingPull
+			? "Pull semantically relevant documents from the hidden full corpus into the visible workspace using multiple focused queries. Updates the current workspace and returns only a short status."
+			: "Remove most semantically unrelated documents from the current benchmark corpus using multiple semantic sub-queries. Updates the current corpus directory and returns only a short status.",
+		promptSnippet: agentFacingPull
+			? "pull(queries) retrieves semantically relevant documents from the hidden full corpus into the visible workspace. The benchmark harness controls topK and candidate limits."
+			: "filter removes most documents that are semantically unrelated to the question from the current corpus directory. After using it, continue normal local search and evidence reading with bash, rg, find, ls, and read.",
+		promptGuidelines: agentFacingPull
+			? [
+					"queries is a list of focused semantic query strings.",
+					"Retrieved files are materialized directly in the current workspace.",
+					"Some filenames may start with qN_0001__, meaning query N retrieved that document at rank 1. Lower rank numbers are more similar to that query.",
+					"pull is not evidence; final answers must come from document text actually searched or read in the workspace.",
+				]
+			: [
+					"Use filter once near the beginning after decomposing a document-retrieval question into focused semantic sub-queries.",
+					"The filter operation removes most semantically unrelated documents from the visible working corpus; it does not answer the question or rank evidence.",
+					"Some filtered filenames may start with qN_0001__, meaning query N retrieved that document near the top. Use lower numbers only as a navigation hint.",
+					"After filter, continue normal DCI-style local exploration with bash, rg, find, ls, and read, starting from rare clue anchors.",
+				],
 		parameters: denseFilterSchema,
 
 		async execute(_toolCallId, params: DenseFilterToolInput, signal?: AbortSignal) {
@@ -382,8 +478,9 @@ export function createDenseFilterToolDefinition(
 				content: [
 					{
 						type: "text",
-						text:
-							viewMode === "hardlink"
+						text: agentFacingPull
+							? "Workspace updated. Search and read the current workspace with bash, rg, find, ls, and read."
+							: viewMode === "hardlink"
 								? "Corpus has been slimmed down. Continue searching the current corpus with bash, rg, find, ls, and read."
 								: "Corpus filter state has been updated. Continue searching the current corpus with bash, rg, find, ls, and read.",
 					},
@@ -394,7 +491,7 @@ export function createDenseFilterToolDefinition(
 
 		renderCall(args, theme) {
 			const text = new Text("", 0, 0);
-			text.setText(formatDenseFilterCall(args, theme));
+			text.setText(formatDenseFilterCall(args, toolName, theme));
 			return text;
 		},
 

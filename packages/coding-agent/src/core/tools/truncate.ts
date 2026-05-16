@@ -3,14 +3,37 @@
  *
  * Truncation is based on two independent limits - whichever is hit first wins:
  * - Line limit (default: 2000 lines)
- * - Byte limit (default: 50KB)
+ * - Byte limit (default: 10KB)
  *
  * Never returns partial lines (except bash tail truncation edge case).
  */
 
 export const DEFAULT_MAX_LINES = 2000;
-export const DEFAULT_MAX_BYTES = 50 * 1024; // 50KB
+export const DEFAULT_MAX_BYTES = 10 * 1024; // 10KB
 export const GREP_MAX_LINE_LENGTH = 500; // Max chars per grep match line
+const DEFAULT_LONG_MATCH_SNIPPET_CHARS = 1000;
+const DEFAULT_LONG_MATCH_READ_WINDOW_CHARS = 1600;
+
+function readPositiveIntegerEnv(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (!raw) return fallback;
+	const parsed = Number.parseInt(raw, 10);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+export const BASH_MAX_LINE_LENGTH = readPositiveIntegerEnv("DCI_BASH_MAX_LINE_CHARS", 1500);
+export const BASH_LONG_MATCH_SNIPPET_CHARS = readPositiveIntegerEnv(
+	"DCI_BASH_LONG_MATCH_SNIPPET_CHARS",
+	DEFAULT_LONG_MATCH_SNIPPET_CHARS,
+);
+export const BASH_LONG_MATCH_READ_WINDOW_CHARS = readPositiveIntegerEnv(
+	"DCI_BASH_LONG_MATCH_READ_WINDOW_CHARS",
+	DEFAULT_LONG_MATCH_READ_WINDOW_CHARS,
+);
+
+export function isLegacyTruncationMode(): boolean {
+	return process.env.DCI_TRUNCATION_MODE === "legacy";
+}
 
 export interface TruncationResult {
 	/** The truncated content */
@@ -40,8 +63,26 @@ export interface TruncationResult {
 export interface TruncationOptions {
 	/** Maximum number of lines (default: 2000) */
 	maxLines?: number;
-	/** Maximum number of bytes (default: 50KB) */
+	/** Maximum number of bytes (default: 10KB) */
 	maxBytes?: number;
+}
+
+export interface LineClampResult {
+	/** Content with long individual lines shortened */
+	content: string;
+	/** Whether any line was shortened */
+	clamped: boolean;
+	/** Number of lines shortened */
+	clampedLines: number;
+	/** Character limit applied to each line */
+	maxChars: number;
+	/** Number of long lines that looked like grep/rg matches and were converted to bounded snippets */
+	structuredMatchLines?: number;
+}
+
+export interface LineClampOptions {
+	maxChars?: number;
+	command?: string;
 }
 
 /**
@@ -55,6 +96,162 @@ export function formatSize(bytes: number): string {
 	} else {
 		return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 	}
+}
+
+type ParsedMatchLine = {
+	path: string;
+	lineNumber: number;
+	text: string;
+};
+
+function parseMatchLine(line: string): ParsedMatchLine | undefined {
+	const separator = /:(\d+):/g;
+	let match = separator.exec(line);
+	while (match !== null) {
+		const path = line.slice(0, match.index);
+		if (!path) {
+			match = separator.exec(line);
+			continue;
+		}
+		const lineNumber = Number.parseInt(match[1] ?? "", 10);
+		if (!Number.isFinite(lineNumber) || lineNumber <= 0) {
+			match = separator.exec(line);
+			continue;
+		}
+		const text = line.slice(match.index + match[0].length);
+		return { path, lineNumber, text };
+	}
+	return undefined;
+}
+
+function unescapeShellQuoted(value: string): string {
+	return value
+		.replace(/\\(["'\\])/g, "$1")
+		.replace(/\\b/g, "")
+		.replace(/\\s/g, " ")
+		.replace(/\\\//g, "/");
+}
+
+function extractLikelySearchTerms(command: string | undefined): string[] {
+	if (!command) return [];
+	const terms: string[] = [];
+	const quoted = /(["'])((?:\\.|(?!\1).)+)\1/g;
+	let match = quoted.exec(command);
+	while (match !== null) {
+		const raw = unescapeShellQuoted(match[2] ?? "").trim();
+		if (!raw) {
+			match = quoted.exec(command);
+			continue;
+		}
+		for (const part of raw.split("|")) {
+			const cleaned = part
+				.replace(/\(\?:?/g, "")
+				.replace(/[()[\]{}^$+*?.]/g, " ")
+				.replace(/\\/g, "")
+				.replace(/\s+/g, " ")
+				.trim();
+			if (cleaned.length >= 2) terms.push(cleaned);
+		}
+		if (terms.length > 0) break;
+		match = quoted.exec(command);
+	}
+	return Array.from(new Set(terms)).slice(0, 16);
+}
+
+function findLikelyMatchOffset(text: string, command: string | undefined): { offset: number; term?: string } {
+	const lower = text.toLowerCase();
+	for (const term of extractLikelySearchTerms(command)) {
+		const idx = lower.indexOf(term.toLowerCase());
+		if (idx >= 0) return { offset: idx, term };
+	}
+	return { offset: 0 };
+}
+
+function jsonString(value: string): string {
+	return JSON.stringify(value);
+}
+
+function clampStart(value: number): number {
+	return Math.max(0, Math.floor(value));
+}
+
+function buildLongMatchReplacement(
+	line: string,
+	command: string | undefined,
+	maxChars: number,
+): { text: string; structured: boolean } {
+	const parsed = parseMatchLine(line);
+	if (!parsed) {
+		const omitted = line.length - maxChars;
+		const headChars = Math.ceil(maxChars / 2);
+		const tailChars = Math.floor(maxChars / 2);
+		return {
+			text: `${line.slice(0, headChars)}... [line truncated, ${omitted} chars omitted] ...${line.slice(-tailChars)}`,
+			structured: false,
+		};
+	}
+
+	const snippetChars = Math.max(80, BASH_LONG_MATCH_SNIPPET_CHARS);
+	const readWindowChars = Math.max(snippetChars, BASH_LONG_MATCH_READ_WINDOW_CHARS);
+	const likelyMatch = findLikelyMatchOffset(parsed.text, command);
+	const snippetStart = clampStart(likelyMatch.offset - Math.floor(snippetChars / 2));
+	const snippetEnd = Math.min(parsed.text.length, snippetStart + snippetChars);
+	const readStart = clampStart(likelyMatch.offset - Math.floor(readWindowChars / 4));
+	const snippetPrefix = snippetStart > 0 ? "..." : "";
+	const snippetSuffix = snippetEnd < parsed.text.length ? "..." : "";
+	const snippet = `${snippetPrefix}${parsed.text.slice(snippetStart, snippetEnd)}${snippetSuffix}`;
+	const term = likelyMatch.term ? `term=${JSON.stringify(likelyMatch.term)}; ` : "";
+	if (parsed.lineNumber === 1) {
+		return {
+			text: `${parsed.path}:${parsed.lineNumber}: ${snippet} [long line clipped; ${term}lineChars=${parsed.text.length}; read={"path":${jsonString(parsed.path)},"charOffset":${readStart},"charLimit":${readWindowChars}}]`,
+			structured: true,
+		};
+	} else {
+		return {
+			text: `${parsed.path}:${parsed.lineNumber}: ${snippet} [long line clipped; ${term}lineChars=${parsed.text.length}; read={"path":${jsonString(parsed.path)},"offset":${parsed.lineNumber},"limit":20}]`,
+			structured: true,
+		};
+	}
+}
+
+/**
+ * Clamp individual long lines. Grep/rg-style long match lines are converted to
+ * bounded snippets with a read(...) continuation hint, which preserves keyword
+ * search freedom without disclosing full single-line OCR/PDF documents.
+ */
+export function clampLongLines(
+	content: string,
+	optionsOrMaxChars: LineClampOptions | number = BASH_MAX_LINE_LENGTH,
+): LineClampResult {
+	const options = typeof optionsOrMaxChars === "number" ? { maxChars: optionsOrMaxChars } : optionsOrMaxChars;
+	const maxChars = options.maxChars ?? BASH_MAX_LINE_LENGTH;
+	if (isLegacyTruncationMode() || process.env.DCI_DISABLE_BASH_LINE_CLAMP === "1") {
+		return { content, clamped: false, clampedLines: 0, maxChars, structuredMatchLines: 0 };
+	}
+	if (maxChars < 20) {
+		return { content, clamped: false, clampedLines: 0, maxChars, structuredMatchLines: 0 };
+	}
+
+	let clamped = false;
+	let clampedLines = 0;
+	let structuredMatchLines = 0;
+	const lines = content.split("\n");
+	const output = lines.map((line) => {
+		if (line.length <= maxChars) return line;
+		clamped = true;
+		clampedLines++;
+		const replacement = buildLongMatchReplacement(line, options.command, maxChars);
+		if (replacement.structured) structuredMatchLines++;
+		return replacement.text;
+	});
+
+	return {
+		content: output.join("\n"),
+		clamped,
+		clampedLines,
+		maxChars,
+		structuredMatchLines,
+	};
 }
 
 /**
@@ -191,12 +388,14 @@ export function truncateTail(content: string, options: TruncationOptions = {}): 
 
 		if (outputBytesCount + lineBytes > maxBytes) {
 			truncatedBy = "bytes";
-			// Edge case: if we haven't added ANY lines yet and this line exceeds maxBytes,
-			// take the end of the line (partial)
-			if (outputLinesArr.length === 0) {
-				const truncatedLine = truncateStringToBytesFromEnd(line, maxBytes);
+			// Edge case: if a single line exceeds maxBytes, keep the end of that
+			// line. This also handles commands that emit one huge line followed by
+			// a trailing newline; otherwise the retained tail can be only "".
+			const retainedBytes = Buffer.byteLength(outputLinesArr.join("\n"), "utf-8");
+			if (outputLinesArr.length === 0 || retainedBytes === 0) {
+				const truncatedLine = truncateStringToBytesFromEnd(line, maxBytes - retainedBytes);
 				outputLinesArr.unshift(truncatedLine);
-				outputBytesCount = Buffer.byteLength(truncatedLine, "utf-8");
+				outputBytesCount = Buffer.byteLength(outputLinesArr.join("\n"), "utf-8");
 				lastLinePartial = true;
 			}
 			break;

@@ -105,9 +105,6 @@ export default function (pi: ExtensionAPI) {
 			let text = theme.fg("toolTitle", theme.bold("$ "));
 			const cmd = args.command.length > 80 ? `${args.command.slice(0, 77)}...` : args.command;
 			text += theme.fg("accent", cmd);
-			if (args.timeout) {
-				text += theme.fg("dim", ` (timeout: ${args.timeout}s)`);
-			}
 			return new Text(text, 0, 0);
 		},
 
