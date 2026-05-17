@@ -30,7 +30,7 @@ const readSchema = Type.Object({
 	offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed)" })),
 	limit: Type.Optional(Type.Number({ description: "Maximum number of lines to read" })),
 	charOffset: Type.Optional(
-		Type.Number({ description: "Character offset for reading a window inside a long single-line text file" }),
+		Type.Number({ description: "Character offset for reading a window inside a long text file" }),
 	),
 	charLimit: Type.Optional(
 		Type.Number({ description: "Maximum characters to return when charOffset is used. Default: 4096" }),

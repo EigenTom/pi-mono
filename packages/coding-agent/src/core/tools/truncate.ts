@@ -217,7 +217,7 @@ function buildLongMatchReplacement(
 /**
  * Clamp individual long lines. Grep/rg-style long match lines are converted to
  * bounded snippets with a read(...) continuation hint, which preserves keyword
- * search freedom without disclosing full single-line OCR/PDF documents.
+ * search freedom without disclosing oversized document lines.
  */
 export function clampLongLines(
 	content: string,
