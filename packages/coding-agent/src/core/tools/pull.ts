@@ -219,16 +219,38 @@ function reflowLongLineText(text: string, width: number): string {
 	return `${lines.join("\n")}\n`;
 }
 
+function wrapLongTextLines(text: string, width: number): string {
+	const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+	const output: string[] = [];
+	for (const line of normalized.split("\n")) {
+		if (line.length <= width) {
+			output.push(line);
+			continue;
+		}
+		for (let offset = 0; offset < line.length; offset += width) {
+			output.push(line.slice(offset, offset + width));
+		}
+	}
+	return output.join("\n");
+}
+
 async function materializeFile(args: { sourcePath: string; targetPath: string; ops: PullOperations }): Promise<void> {
 	const { sourcePath, targetPath, ops } = args;
-	if (!isEnabledEnv("DCI_REFLOW_SINGLE_LINE_TEXT")) {
+	const wrapLongLines = isEnabledEnv("DCI_WRAP_LONG_TEXT_LINES");
+	const reflowSingleLine = isEnabledEnv("DCI_REFLOW_SINGLE_LINE_TEXT");
+	if (!wrapLongLines && !reflowSingleLine) {
 		await ops.link(sourcePath, targetPath);
 		return;
 	}
 
-	const width = readPositiveIntEnv("DCI_REFLOW_SINGLE_LINE_WIDTH") ?? 1_200;
 	const text = await ops.readFile(sourcePath);
+	if (wrapLongLines) {
+		const width = readPositiveIntEnv("DCI_WRAP_LONG_TEXT_LINE_WIDTH") ?? 2_000;
+		await ops.writeFile(targetPath, wrapLongTextLines(text, width));
+		return;
+	}
 
+	const width = readPositiveIntEnv("DCI_REFLOW_SINGLE_LINE_WIDTH") ?? 1_200;
 	const firstNewline = text.indexOf("\n");
 	const secondNewline = firstNewline >= 0 ? text.indexOf("\n", firstNewline + 1) : -1;
 	if (firstNewline >= 0 && secondNewline >= 0) {

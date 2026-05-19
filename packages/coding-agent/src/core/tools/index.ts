@@ -12,15 +12,6 @@ export {
 	createLocalBashOperations,
 } from "./bash.js";
 export {
-	createDenseFilterTool,
-	createDenseFilterToolDefinition,
-	type DenseFilterOperations,
-	type DenseFilterToolDetails,
-	type DenseFilterToolInput,
-	type DenseFilterToolOptions,
-	type DenseFilterViewMode,
-} from "./dense_filter.js";
-export {
 	createEditTool,
 	createEditToolDefinition,
 	type EditOperations,
@@ -108,7 +99,6 @@ import {
 	createBashTool,
 	createBashToolDefinition,
 } from "./bash.js";
-import { createDenseFilterTool, createDenseFilterToolDefinition } from "./dense_filter.js";
 import { createEditTool, createEditToolDefinition, editTool, editToolDefinition } from "./edit.js";
 import { createFindTool, createFindToolDefinition, findTool, findToolDefinition } from "./find.js";
 import { createGrepTool, createGrepToolDefinition, grepTool, grepToolDefinition } from "./grep.js";
@@ -129,19 +119,12 @@ export type ToolDef = ToolDefinition<any, any>;
 export const codingTools: Tool[] = [readTool, bashTool, editTool, writeTool];
 export const readOnlyTools: Tool[] = [readTool, grepTool, findTool, lsTool];
 
-function useSinglePullImplementation(): boolean {
-	const value = process.env.DCI_PULL_IMPLEMENTATION?.toLowerCase();
-	return value === "single" || value === "single_pull" || value === "once";
-}
-
 function createAgentFacingPullTool(cwd: string): Tool {
-	return useSinglePullImplementation() ? createDenseFilterTool(cwd, { toolName: "pull" }) : createPullTool(cwd);
+	return createPullTool(cwd);
 }
 
 function createAgentFacingPullToolDefinition(cwd: string): ToolDef {
-	return useSinglePullImplementation()
-		? createDenseFilterToolDefinition(cwd, { toolName: "pull" })
-		: createPullToolDefinition(cwd);
+	return createPullToolDefinition(cwd);
 }
 
 export const allTools = {
