@@ -13,6 +13,7 @@ import { waitForChildProcess } from "../../utils/child-process.js";
 import { getShellConfig, getShellEnv, killProcessTree } from "../../utils/shell.js";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.js";
 import { recordBudgetEvent } from "./budget-gate.js";
+import { createPullToolDefinition } from "./pull.js";
 import { getTextOutput, invalidArgText, str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 import {
@@ -44,6 +45,166 @@ function getDefaultBashTimeout(): number | undefined {
 	if (!raw) return undefined;
 	const parsed = Number(raw);
 	return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function shouldBlockNetworkCommand(command: string): boolean {
+	if (process.env.DCI_BASH_BLOCK_NETWORK !== "1") return false;
+	const patterns = [
+		/\b(?:curl|wget|aria2c|httpie|xh)\b/i,
+		/\b(?:nc|ncat|netcat|telnet|ssh|scp|sftp|rsync)\b/i,
+		/\b(?:python3?|node|ruby|perl)\b[\s\S]*(?:https?:\/\/|requests\.|urllib\.|http\.client|fetch\s*\()/i,
+		/https?:\/\//i,
+	];
+	return patterns.some((pattern) => pattern.test(command));
+}
+
+function pullTerminalToolsEnabled(): boolean {
+	const raw = process.env.DCI_PULL_TERMINAL_TOOLS?.toLowerCase();
+	return raw === "1" || raw === "true" || raw === "yes";
+}
+
+function splitShellWords(command: string): string[] | undefined {
+	const words: string[] = [];
+	let current = "";
+	let quote: "'" | '"' | undefined;
+	let escaped = false;
+	for (const char of command.trim()) {
+		if (escaped) {
+			current += char;
+			escaped = false;
+			continue;
+		}
+		if (char === "\\" && quote !== "'") {
+			escaped = true;
+			continue;
+		}
+		if (quote) {
+			if (char === quote) quote = undefined;
+			else current += char;
+			continue;
+		}
+		if (char === "'" || char === '"') {
+			quote = char;
+			continue;
+		}
+		if (/\s/.test(char)) {
+			if (current) {
+				words.push(current);
+				current = "";
+			}
+			continue;
+		}
+		current += char;
+	}
+	if (escaped || quote) return undefined;
+	if (current) words.push(current);
+	return words;
+}
+
+type TerminalPullCommand = { kind: "pull"; query: string; topK: number; error?: string };
+
+function parseTerminalPullCommand(command: string): TerminalPullCommand | undefined {
+	if (!pullTerminalToolsEnabled()) return undefined;
+	const normalized = command.replace(/\\\n/g, " ").trim();
+	if (!/^pull\b/.test(normalized)) return undefined;
+	if (/[|;&<>`$()]/.test(normalized)) {
+		return {
+			kind: "pull",
+			query: "",
+			topK: 0,
+			error: 'Invalid pull command. Use `pull --query "query terms" --topK 600`; shell operators, pipes, redirects, and substitutions are not supported.',
+		};
+	}
+	const words = splitShellWords(normalized);
+	if (!words || words.length === 0) {
+		return {
+			kind: "pull",
+			query: "",
+			topK: 0,
+			error: 'Invalid pull command. Use `pull --query "query terms" --topK 600` with balanced quotes.',
+		};
+	}
+	const [program, ...args] = words;
+	if (program !== "pull") return undefined;
+	let query = "";
+	let topK: number | undefined;
+	const positional: string[] = [];
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index]!;
+		if (arg === "--query" || arg === "-q") {
+			const value = args[index + 1];
+			if (!value) {
+				return { kind: "pull", query: "", topK: 0, error: "pull requires a non-empty query after --query." };
+			}
+			query = value;
+			index++;
+			continue;
+		}
+		if (arg.startsWith("--query=")) {
+			query = arg.slice("--query=".length).trim();
+			continue;
+		}
+		if (arg === "--topK" || arg === "--top-k" || arg === "-k") {
+			const value = args[index + 1];
+			if (!value) {
+				return { kind: "pull", query: "", topK: 0, error: "pull requires an integer topK after --topK." };
+			}
+			topK = Number.parseInt(value, 10);
+			index++;
+			continue;
+		}
+		if (arg.startsWith("--topK=")) {
+			topK = Number.parseInt(arg.slice("--topK=".length), 10);
+			continue;
+		}
+		if (arg.startsWith("--top-k=")) {
+			topK = Number.parseInt(arg.slice("--top-k=".length), 10);
+			continue;
+		}
+		if (arg.startsWith("-")) {
+			return {
+				kind: "pull",
+				query: "",
+				topK: 0,
+				error: 'Invalid pull command. Use `pull --query "query terms" --topK 600`.',
+			};
+		}
+		positional.push(arg);
+	}
+	if (!query && positional.length > 0) query = positional.join(" ");
+	query = query.replace(/\s+/g, " ").trim();
+	if (!query) {
+		return {
+			kind: "pull",
+			query: "",
+			topK: 0,
+			error: 'pull requires a query. Use `pull --query "query terms" --topK 600`.',
+		};
+	}
+	if (!Number.isFinite(topK) || topK === undefined) {
+		return { kind: "pull", query, topK: 0, error: "pull requires an integer topK, for example `--topK 600`." };
+	}
+	return { kind: "pull", query, topK };
+}
+
+async function executeTerminalPullCommand(
+	cwd: string,
+	parsed: TerminalPullCommand,
+	signal?: AbortSignal,
+): Promise<{ content: Array<{ type: "text"; text: string }>; details: any }> {
+	if (parsed.error) {
+		return { content: [{ type: "text", text: parsed.error }], details: undefined };
+	}
+	const tool = createPullToolDefinition(cwd);
+	const result = await tool.execute(
+		"terminal-pull",
+		{ query: parsed.query, topK: parsed.topK },
+		signal,
+		undefined,
+		undefined as any,
+	);
+	const text = getTextOutput(result as any, false) || "(no output)";
+	return { content: [{ type: "text", text }], details: (result as any).details };
 }
 
 export interface BashToolDetails {
@@ -283,12 +444,29 @@ export function createBashToolDefinition(
 		name: "bash",
 		label: "bash",
 		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Commands are capped by the harness timeout. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first), and individual long lines are shortened to ${BASH_MAX_LINE_LENGTH} chars. If output is truncated, refine the command or use read with offset/charOffset.`,
-		promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
+		promptSnippet: pullTerminalToolsEnabled()
+			? 'Execute bash commands (ls, grep, find, etc.); also supports corpus retrieval with `pull --query "query terms" --topK 600`.'
+			: "Execute bash commands (ls, grep, find, etc.)",
 		parameters: bashSchema,
 		async execute(_toolCallId, { command }: { command: string }, signal?: AbortSignal, onUpdate?, _ctx?) {
 			const budget = await recordBudgetEvent(cwd, "bash");
 			if (budget.blocked) {
 				return { content: [{ type: "text", text: budget.blocked }], details: undefined };
+			}
+			const terminalPullCommand = parseTerminalPullCommand(command);
+			if (terminalPullCommand) {
+				return executeTerminalPullCommand(cwd, terminalPullCommand, signal);
+			}
+			if (shouldBlockNetworkCommand(command)) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: 'Network access is disabled for bash in this isolated environment. Use `pull --query "query terms" --topK N` to retrieve corpus documents; use bash only on local files.',
+						},
+					],
+					details: undefined,
+				};
 			}
 			const effectiveTimeout = getDefaultBashTimeout() ?? 30;
 			const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;

@@ -36,6 +36,15 @@ type RetrieverResult = {
 	score: number;
 };
 
+type RetrieverDocument = {
+	docid?: string;
+	doc_path?: string;
+	text?: string;
+	content?: string;
+	url?: string;
+	title?: string;
+};
+
 type PullLayout = "query" | "pull" | "root";
 type PullMaterializationMode =
 	| "original"
@@ -267,6 +276,31 @@ async function materializeFile(args: { sourcePath: string; targetPath: string; o
 	await ops.writeFile(targetPath, reflowLongLineText(text, width));
 }
 
+async function materializeText(args: { text: string; targetPath: string; ops: PullOperations }): Promise<void> {
+	const { text, targetPath, ops } = args;
+	const wrapLongLines = isEnabledEnv("DCI_WRAP_LONG_TEXT_LINES");
+	const reflowSingleLine = isEnabledEnv("DCI_REFLOW_SINGLE_LINE_TEXT");
+	if (wrapLongLines) {
+		const width = readPositiveIntEnv("DCI_WRAP_LONG_TEXT_LINE_WIDTH") ?? 2_000;
+		await ops.writeFile(targetPath, wrapLongTextLines(text, width));
+		return;
+	}
+	if (reflowSingleLine) {
+		const width = readPositiveIntEnv("DCI_REFLOW_SINGLE_LINE_WIDTH") ?? 1_200;
+		const firstNewline = text.indexOf("\n");
+		const secondNewline = firstNewline >= 0 ? text.indexOf("\n", firstNewline + 1) : -1;
+		const minBytes = readPositiveIntEnv("DCI_REFLOW_SINGLE_LINE_MIN_BYTES");
+		if (
+			(firstNewline < 0 || secondNewline < 0) &&
+			(minBytes === undefined || Buffer.byteLength(text, "utf8") >= minBytes)
+		) {
+			await ops.writeFile(targetPath, reflowLongLineText(text, width));
+			return;
+		}
+	}
+	await ops.writeFile(targetPath, text);
+}
+
 async function submitNowMarkerExists(viewDir: string): Promise<boolean> {
 	try {
 		await access(join(viewDir, SUBMIT_NOW_MARKER));
@@ -287,6 +321,15 @@ async function nextPullIndex(viewDir: string, ops: PullOperations): Promise<numb
 		return indices.length > 0 ? Math.max(...indices) + 1 : 1;
 	} catch {
 		return 1;
+	}
+}
+
+async function countExistingPulls(metaBaseDir: string, ops: PullOperations): Promise<number> {
+	try {
+		const names = await ops.readdir(metaBaseDir);
+		return names.filter((name) => /^pull_\d+$/.test(name)).length;
+	} catch {
+		return 0;
 	}
 }
 
@@ -345,19 +388,43 @@ async function retrieveOne(
 	return Array.isArray(data.results) ? data.results : [];
 }
 
+async function fetchDocumentText(
+	documentBaseUrl: string,
+	hit: RetrieverResult,
+	ops: PullOperations,
+	signal?: AbortSignal,
+): Promise<string | undefined> {
+	const endpoint = new URL(documentBaseUrl);
+	if (hit.docid) {
+		endpoint.searchParams.set("docid", hit.docid);
+	} else {
+		endpoint.searchParams.set("doc_path", hit.doc_path);
+	}
+	const response = await ops.fetch(endpoint.toString(), {
+		method: "GET",
+		signal,
+	});
+	if (!response.ok) return undefined;
+	const data = (await response.json()) as RetrieverDocument;
+	const text = data.text ?? data.content;
+	return typeof text === "string" && text.trim() ? text : undefined;
+}
+
 async function materializeQueryDocs(args: {
 	query: string;
 	queryIndex: number;
 	hits: RetrieverResult[];
 	pullDir: string;
 	targetDir: string;
-	sourceRoot: string;
+	sourceRoot?: string;
+	documentBaseUrl?: string;
 	ops: PullOperations;
 	layout: PullLayout;
 	materializationMode: PullMaterializationMode;
 	pullIndex: number;
 	createdSet?: Set<string>;
 	existingSourcePaths?: Set<string>;
+	concurrency?: number;
 }): Promise<{
 	queryDir: string;
 	created: string[];
@@ -367,6 +434,8 @@ async function materializeQueryDocs(args: {
 }> {
 	const { query, queryIndex, hits, pullDir, targetDir, sourceRoot, ops, layout, materializationMode, pullIndex } =
 		args;
+	const documentBaseUrl = args.documentBaseUrl;
+	const concurrency = Math.max(1, args.concurrency ?? 1);
 	const queryDirName = `q${String(queryIndex + 1).padStart(2, "0")}_${slugify(query)}`;
 	const queryDir = layout === "query" ? join(targetDir, queryDirName) : targetDir;
 	const created: string[] = [];
@@ -376,6 +445,14 @@ async function materializeQueryDocs(args: {
 	const createdSet = args.createdSet ?? new Set<string>();
 	const existingSourcePaths = args.existingSourcePaths ?? new Set<string>();
 	await ops.mkdir(queryDir);
+
+	const planned: Array<{
+		hit: RetrieverResult;
+		hitIndex: number;
+		safePath: string;
+		sourcePath: string;
+		targetPath: string;
+	}> = [];
 
 	for (const [hitIndex, hit] of hits.entries()) {
 		const safePath = safeRelativePath(hit.doc_path);
@@ -389,8 +466,8 @@ async function materializeQueryDocs(args: {
 		}
 		if (createdSet.has(safePath)) continue;
 
-		const sourcePath = resolve(sourceRoot, safePath);
-		if (!isInside(sourceRoot, sourcePath)) {
+		const sourcePath = sourceRoot ? resolve(sourceRoot, safePath) : "";
+		if (!documentBaseUrl && (!sourceRoot || !isInside(sourceRoot, sourcePath))) {
 			missing.push(hit.doc_path);
 			continue;
 		}
@@ -411,20 +488,53 @@ async function materializeQueryDocs(args: {
 			continue;
 		}
 
+		createdSet.add(safePath);
+		planned.push({ hit, hitIndex, safePath, sourcePath, targetPath });
+	}
+
+	async function materializePlanned(item: (typeof planned)[number]): Promise<{
+		safePath: string;
+		document?: MaterializedDocument;
+		missing?: string;
+	}> {
+		const { hit, hitIndex, safePath, sourcePath, targetPath } = item;
 		try {
 			await ops.mkdir(dirname(targetPath));
-			await materializeFile({ sourcePath, targetPath, ops });
-			created.push(safePath);
-			createdDocuments.push({
-				sourcePath: safePath,
-				workspacePath: relative(pullDir, targetPath).replace(/\\/g, "/"),
-				rank: hitIndex + 1,
-				score: hit.score,
-				title: safeFilename(safePath).replace(/\.txt$/i, ""),
-			});
-			createdSet.add(safePath);
+			if (documentBaseUrl) {
+				const text = await fetchDocumentText(documentBaseUrl, hit, ops);
+				if (!text) {
+					return { safePath, missing: hit.doc_path };
+				}
+				await materializeText({ text, targetPath, ops });
+			} else {
+				await materializeFile({ sourcePath, targetPath, ops });
+			}
+			return {
+				safePath,
+				document: {
+					sourcePath: safePath,
+					workspacePath: relative(pullDir, targetPath).replace(/\\/g, "/"),
+					rank: hitIndex + 1,
+					score: hit.score,
+					title: safeFilename(safePath).replace(/\.txt$/i, ""),
+				},
+			};
 		} catch {
-			missing.push(hit.doc_path);
+			return { safePath, missing: hit.doc_path };
+		}
+	}
+
+	for (let start = 0; start < planned.length; start += concurrency) {
+		const chunk = planned.slice(start, start + concurrency);
+		const results = await Promise.all(chunk.map((item) => materializePlanned(item)));
+		for (const result of results) {
+			if (result.document) {
+				created.push(result.safePath);
+				createdDocuments.push(result.document);
+			} else if (result.missing) {
+				missing.push(result.missing);
+				createdSet.delete(result.safePath);
+			}
 		}
 	}
 
@@ -460,14 +570,21 @@ export function createPullToolDefinition(cwd: string, options?: PullToolOptions)
 		? resolve(process.env.DCI_PULL_META_DIR)
 		: join(viewDir, ".dci_pull_meta");
 	const sourceRoot = options?.sourceRoot ?? process.env.DCI_PULL_SOURCE_ROOT;
+	const documentBaseUrl = process.env.DCI_PULL_DOCUMENT_BASE_URL;
 	const layout = parsePullLayout(process.env.DCI_PULL_LAYOUT);
-	const promptMode = process.env.DCI_PULL_PROMPT_MODE === "rank_aware" ? "rank_aware" : "default";
+	const promptMode =
+		process.env.DCI_PULL_PROMPT_MODE === "rank_aware" || process.env.DCI_PULL_PROMPT_MODE === "bm25_aware"
+			? process.env.DCI_PULL_PROMPT_MODE
+			: "default";
 	const materializationMode = parsePullMaterializationMode(process.env.DCI_PULL_MATERIALIZATION_MODE);
-	const rankAwareMode = promptMode === "rank_aware" || materializationMode !== "original";
+	const previewLimit = readBoundedPositiveIntEnv("DCI_PULL_PREVIEW_LIMIT", 20, 1, 100);
+	const rankAwareMode =
+		promptMode === "rank_aware" || promptMode === "bm25_aware" || materializationMode !== "original";
 	const discloseNewDocs =
 		materializationMode === "flat_disclosed" ||
 		materializationMode === "root_flat_disclosed" ||
 		materializationMode === "root_qprefix_disclosed";
+	const disclosePreview = discloseNewDocs;
 	const harnessTopK = readPositiveIntEnv("DCI_PULL_TOP_K");
 	const rankAwareMinTopK = readBoundedPositiveIntEnv("DCI_PULL_MIN_TOP_K", 300, 1, 10_000);
 	const rankAwareMaxTopK = Math.max(
@@ -475,13 +592,18 @@ export function createPullToolDefinition(cwd: string, options?: PullToolOptions)
 		readBoundedPositiveIntEnv("DCI_PULL_MAX_TOP_K", 600, rankAwareMinTopK, 10_000),
 	);
 	const rankAwareMaxQueries = readBoundedPositiveIntEnv("DCI_PULL_MAX_QUERIES", 1, 1, 8);
+	const maxPullCalls = readPositiveIntEnv("DCI_PULL_MAX_CALLS");
+	const materializeConcurrency = readBoundedPositiveIntEnv("DCI_PULL_MATERIALIZE_CONCURRENCY", 32, 1, 128);
 	const topKRangeText = `${rankAwareMinTopK}-${rankAwareMaxTopK}`;
 	const rankAwareParameters =
 		rankAwareMaxQueries > 1
 			? Type.Object({
 					query: Type.String({
 						minLength: 1,
-						description: "The main query for one evidence clue. Prefer using only this field.",
+						description:
+							promptMode === "bm25_aware"
+								? "The main query for one evidence clue, consisting of exact keywords and short phrases. Prefer exact names, titles, dates, rare terms, or short phrases."
+								: "The main query for one evidence clue. Prefer using only this field.",
 					}),
 					queryVariants: Type.Optional(
 						Type.Array(Type.String({ minLength: 1 }), {
@@ -498,7 +620,10 @@ export function createPullToolDefinition(cwd: string, options?: PullToolOptions)
 			: Type.Object({
 					query: Type.String({
 						minLength: 1,
-						description: "One concise lexical query. Call pull again for a different clue.",
+						description:
+							promptMode === "bm25_aware"
+								? "One concise query consisting of exact keywords and short phrases. Use exact names, titles, dates, rare terms, or short phrases; call pull again for aliases or a different clue."
+								: "One concise lexical query. Call pull again for a different clue.",
 					}),
 					topK: Type.Integer({
 						minimum: rankAwareMinTopK,
@@ -511,35 +636,49 @@ export function createPullToolDefinition(cwd: string, options?: PullToolOptions)
 	const toolName = "pull";
 	const label = "Pull Corpus Documents";
 	const description = rankAwareMode
-		? discloseNewDocs
+		? disclosePreview
 			? rankAwareMaxQueries > 1
-				? `Pull semantically relevant documents into the visible workspace. Accepts query, optional queryVariants for the same evidence clue, and topK ${topKRangeText}; returns a short ranked preview of newly added documents.`
-				: `Pull semantically relevant documents into the visible workspace. Accepts one query and topK ${topKRangeText}; returns a short ranked preview of newly added documents.`
+				? promptMode === "bm25_aware"
+					? `Pull matching documents into the visible workspace. Accepts query, optional queryVariants for the same evidence clue, and topK ${topKRangeText}; returns a short ranked preview of newly added documents.`
+					: `Pull semantically relevant documents into the visible workspace. Accepts query, optional queryVariants for the same evidence clue, and topK ${topKRangeText}; returns a short ranked preview of newly added documents.`
+				: promptMode === "bm25_aware"
+					? `Pull matching documents into the visible workspace. Accepts one query and topK ${topKRangeText}; returns a short ranked preview of newly added documents.`
+					: `Pull semantically relevant documents into the visible workspace. Accepts one query and topK ${topKRangeText}; returns a short ranked preview of newly added documents.`
 			: rankAwareMaxQueries > 1
-				? `Pull semantically relevant documents from the hidden corpus into the visible workspace. Rank-aware mode accepts query, optional queryVariants for the same evidence clue, and topK ${topKRangeText} per call.`
-				: `Pull semantically relevant documents from the hidden corpus into the visible workspace. Rank-aware mode accepts one query and topK ${topKRangeText} per call.`
+				? promptMode === "bm25_aware"
+					? `Pull matching documents from the hidden corpus into the visible workspace. Accepts query, optional queryVariants for the same evidence clue, and topK ${topKRangeText} per call.`
+					: `Pull semantically relevant documents from the hidden corpus into the visible workspace. Rank-aware mode accepts query, optional queryVariants for the same evidence clue, and topK ${topKRangeText} per call.`
+				: promptMode === "bm25_aware"
+					? `Pull matching documents from the hidden corpus into the visible workspace. Accepts one query and topK ${topKRangeText} per call.`
+					: `Pull semantically relevant documents from the hidden corpus into the visible workspace. Rank-aware mode accepts one query and topK ${topKRangeText} per call.`
 		: "Pull semantically relevant documents from the hidden corpus into the visible workspace, organized by pull call.";
 	const queryShapeDescription =
 		rankAwareMaxQueries > 1
-			? `It accepts one main query, optional queryVariants for the same evidence clue, and required topK ${topKRangeText}. Prefer only query; use queryVariants only for aliases, paraphrases, or complementary wording of that one clue. Do not mix different clues or separate subproblems in one call.`
-			: `It accepts one query string per call and required topK ${topKRangeText}.`;
+			? promptMode === "bm25_aware"
+				? `It accepts one main query consisting of exact keywords and short phrases, optional queryVariants for aliases or alternate surface forms of the same evidence clue, and required topK ${topKRangeText}. Do not mix different clues or separate subproblems in one call.`
+				: `It accepts one main query, optional queryVariants for the same evidence clue, and required topK ${topKRangeText}. Prefer only query; use queryVariants only for aliases, paraphrases, or complementary wording of that one clue. Do not mix different clues or separate subproblems in one call.`
+			: promptMode === "bm25_aware"
+				? `It accepts one query string consisting of exact keywords and short phrases per call and required topK ${topKRangeText}.`
+				: `It accepts one query string per call and required topK ${topKRangeText}.`;
+	const retrievalVerb =
+		promptMode === "bm25_aware" ? "retrieves matching documents" : "retrieves semantically relevant documents";
 	const folderDescription =
 		layout === "root"
 			? rankAwareMode
 				? materializationMode === "root_qprefix_disclosed"
-					? `pull retrieves semantically relevant documents from the hidden corpus into the visible workspace. ${queryShapeDescription} Documents are stored directly in the workspace root with qNN filename prefixes for each pull call. Retrieval ranks are shown in the tool result, not encoded in filenames.`
-					: `pull retrieves semantically relevant documents from the hidden corpus into the visible workspace. ${queryShapeDescription} Documents are stored directly in the workspace root. Retrieval ranks are shown in the tool result, not encoded in filenames.`
+					? `pull ${retrievalVerb} from the hidden corpus into the visible workspace. ${queryShapeDescription} Documents are stored directly in the workspace root with qNN filename prefixes for each pull call.${disclosePreview ? " Retrieval ranks are shown in the tool result, not encoded in filenames." : " The tool result reports counts but does not show document ranks."}`
+					: `pull ${retrievalVerb} from the hidden corpus into the visible workspace. ${queryShapeDescription} Documents are stored directly in the workspace root.${disclosePreview ? " Retrieval ranks are shown in the tool result, not encoded in filenames." : " The tool result reports counts but does not show document ranks."}`
 				: "pull(queries, topK) retrieves semantically relevant documents from the hidden corpus into the visible workspace root."
 			: layout === "pull"
 				? rankAwareMode
 					? discloseNewDocs
-						? `pull retrieves semantically relevant documents from the hidden corpus into the visible workspace. ${queryShapeDescription} Each call creates ./pull_N/ and stores files directly inside it. Retrieval ranks are shown in the tool result, not encoded in filenames.`
-						: `pull retrieves semantically relevant documents from the hidden corpus into the visible workspace. ${queryShapeDescription} Each call creates ./pull_N/ and stores rank-prefixed files directly inside it; lower rank numbers are more similar to the query.`
+						? `pull ${retrievalVerb} from the hidden corpus into the visible workspace. ${queryShapeDescription} Each call creates ./pull_N/ and stores files directly inside it.${disclosePreview ? " Retrieval ranks are shown in the tool result, not encoded in filenames." : " The tool result reports counts but does not show document ranks."}`
+						: `pull ${retrievalVerb} from the hidden corpus into the visible workspace. ${queryShapeDescription} Each call creates ./pull_N/ and stores rank-prefixed files directly inside it; lower rank numbers are more similar to the query.`
 					: "pull(queries, topK) retrieves semantically relevant documents from the hidden corpus into the visible workspace. Each call creates ./pull_N/ and stores retrieved files directly inside it."
 				: rankAwareMode
 					? discloseNewDocs
-						? `pull retrieves semantically relevant documents from the hidden corpus into the visible workspace. ${queryShapeDescription} Retrieval ranks are shown in the tool result, not encoded in filenames.`
-						: `pull retrieves semantically relevant documents from the hidden corpus into the visible workspace. ${queryShapeDescription} Each call creates ./pull_N/ and stores rank-prefixed files under that workspace; lower rank numbers are more similar to the query.`
+						? `pull ${retrievalVerb} from the hidden corpus into the visible workspace. ${queryShapeDescription}${disclosePreview ? " Retrieval ranks are shown in the tool result, not encoded in filenames." : " The tool result reports counts but does not show document ranks."}`
+						: `pull ${retrievalVerb} from the hidden corpus into the visible workspace. ${queryShapeDescription} Each call creates ./pull_N/ and stores rank-prefixed files under that workspace; lower rank numbers are more similar to the query.`
 					: "pull(queries, topK) retrieves semantically relevant documents from the hidden corpus into the visible workspace. Each call creates ./pull_N/ with one subfolder per query.";
 
 	const promptSnippet = folderDescription;
@@ -547,15 +686,23 @@ export function createPullToolDefinition(cwd: string, options?: PullToolOptions)
 		"The visible workspace starts empty; pull adds documents from the hidden corpus.",
 		rankAwareMode
 			? rankAwareMaxQueries > 1
-				? `The query parameter is the main query. Prefer leaving queryVariants empty. Use queryVariants only when one query cannot express the clue clearly; variants must be aliases, paraphrases, or complementary wording of that same clue, not different clues or separate subproblems. topK is required; choose topK between ${rankAwareMinTopK} and ${rankAwareMaxTopK} for each query string.`
-				: `The query parameter is a single string. topK is required; choose topK between ${rankAwareMinTopK} and ${rankAwareMaxTopK} for each call.`
+				? promptMode === "bm25_aware"
+					? `The query parameter is the main query consisting of exact keywords and short phrases. Use exact surface forms from the clue: names, titles, quoted phrases, dates, places, rare nouns, and domain terms. queryVariants are only for aliases or alternate spellings of that same clue. topK is required; choose topK between ${rankAwareMinTopK} and ${rankAwareMaxTopK} for each query string.`
+					: `The query parameter is the main query. Prefer leaving queryVariants empty. Use queryVariants only when one query cannot express the clue clearly; variants must be aliases, paraphrases, or complementary wording of that same clue, not different clues or separate subproblems. topK is required; choose topK between ${rankAwareMinTopK} and ${rankAwareMaxTopK} for each query string.`
+				: promptMode === "bm25_aware"
+					? `The query parameter is a single query string consisting of exact keywords and short phrases. Use exact surface forms from the clue: names, titles, quoted phrases, dates, places, rare nouns, and domain terms. topK is required; choose topK between ${rankAwareMinTopK} and ${rankAwareMaxTopK} for each call.`
+					: `The query parameter is a single string. topK is required; choose topK between ${rankAwareMinTopK} and ${rankAwareMaxTopK} for each call.`
 			: "topK is clamped to 100-500 documents per query.",
-		...(promptMode === "rank_aware"
+		...(promptMode === "rank_aware" || promptMode === "bm25_aware"
 			? [
 					rankAwareMaxQueries > 1
-						? "Rank-aware mode accepts query, optional queryVariants for one clue, and topK."
-						: "Rank-aware mode accepts one query string and topK; call pull again for a different clue.",
-					discloseNewDocs
+						? promptMode === "bm25_aware"
+							? "This mode accepts query, optional alias/surface-form queryVariants for one clue, and topK."
+							: "Rank-aware mode accepts query, optional queryVariants for one clue, and topK."
+						: promptMode === "bm25_aware"
+							? "This mode accepts one exact-keyword query string and topK; call pull again for aliases or a different clue."
+							: "Rank-aware mode accepts one query string and topK; call pull again for a different clue.",
+					disclosePreview
 						? "The tool result shows retrieval ranks for newly added documents; lower numbers are more similar."
 						: "Rank prefixes indicate retrieval order within that query; lower numbers are more similar.",
 				]
@@ -582,10 +729,15 @@ export function createPullToolDefinition(cwd: string, options?: PullToolOptions)
 					"Budget limit reached. pull is disabled. Do not retrieve more documents. Answer now using the existing workspace.",
 				);
 			}
-			if (!sourceRoot) {
+			if (maxPullCalls !== undefined && (await countExistingPulls(metaBaseDir, ops)) >= maxPullCalls) {
+				throw new Error(
+					`pull call limit reached (${maxPullCalls}). Do not retrieve more documents. Search/read the existing workspace and answer with the available evidence.`,
+				);
+			}
+			if (!sourceRoot && !documentBaseUrl) {
 				throw new Error("DCI_PULL_SOURCE_ROOT is required for pull hardlink mode");
 			}
-			if (isInside(resolve(sourceRoot), viewDir) || isInside(viewDir, resolve(sourceRoot))) {
+			if (sourceRoot && (isInside(resolve(sourceRoot), viewDir) || isInside(viewDir, resolve(sourceRoot)))) {
 				throw new Error("Pull viewDir must be separate from DCI_PULL_SOURCE_ROOT");
 			}
 
@@ -645,13 +797,15 @@ export function createPullToolDefinition(cwd: string, options?: PullToolOptions)
 					hits,
 					pullDir,
 					targetDir,
-					sourceRoot: resolve(sourceRoot),
+					sourceRoot: sourceRoot ? resolve(sourceRoot) : undefined,
+					documentBaseUrl,
 					ops,
 					layout,
 					materializationMode,
 					pullIndex,
 					createdSet,
 					existingSourcePaths,
+					concurrency: materializeConcurrency,
 				});
 				queryDirs[query] = relative(viewDir, materialized.queryDir).replace(/\\/g, "/");
 				for (const created of materialized.created) {
@@ -669,6 +823,7 @@ export function createPullToolDefinition(cwd: string, options?: PullToolOptions)
 			const perQueryHitCounts = Object.fromEntries(
 				Object.entries(perQueryHits).map(([query, hits]) => [query, hits.length]),
 			);
+			const agentVisiblePreview = topNewDocuments.slice(0, previewLimit);
 			const details: PullToolDetails = {
 				toolKind: "pull",
 				queries: effectiveQueries,
@@ -685,14 +840,12 @@ export function createPullToolDefinition(cwd: string, options?: PullToolOptions)
 				materializedDocumentCount,
 				missingDocumentCount,
 				alreadyVisibleDocumentCount,
-				topNewDocuments: topNewDocuments.slice(0, 20),
+				topNewDocuments: agentVisiblePreview,
 				perQueryHitCounts,
 				queryDirs,
 			};
 			const workspaceDir = layout === "root" ? "." : relative(viewDir, pullDir).replace(/\\/g, "/");
-			const previewLines = topNewDocuments
-				.slice(0, 20)
-				.map((doc) => `- #${doc.rank} ${doc.workspacePath} (${doc.title})`);
+			const previewLines = agentVisiblePreview.map((doc) => `- #${doc.rank} ${doc.workspacePath} (${doc.title})`);
 			const disclosureText =
 				discloseNewDocs && (layout === "pull" || layout === "root")
 					? [
