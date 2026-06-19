@@ -14,6 +14,7 @@ import { getShellConfig, getShellEnv, killProcessTree } from "../../utils/shell.
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.js";
 import { recordBudgetEvent } from "./budget-gate.js";
 import { createPullToolDefinition } from "./pull.js";
+import { createWebFetchToolDefinition, createWebSearchToolDefinition } from "./pull_web.js";
 import { getTextOutput, invalidArgText, str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 import {
@@ -47,6 +48,23 @@ function getDefaultBashTimeout(): number | undefined {
 	return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function sanitizeBashOutputForModel(output: string, cwd: string): string {
+	if (!output) return output;
+	const displayCwd = process.env.PI_DISPLAY_CWD;
+	if (displayCwd === undefined) return output;
+	const normalizedCwd = cwd.replace(/\/+$/, "");
+	if (!normalizedCwd || normalizedCwd === "/") return output;
+	const escapedCwd = escapeRegExp(normalizedCwd);
+	const replacement = displayCwd.replace(/\/+$/, "") || ".";
+	return output
+		.replace(new RegExp(`${escapedCwd}/`, "g"), `${replacement}/`)
+		.replace(new RegExp(escapedCwd, "g"), replacement);
+}
+
 function shouldBlockNetworkCommand(command: string): boolean {
 	if (process.env.DCI_BASH_BLOCK_NETWORK !== "1") return false;
 	const patterns = [
@@ -56,6 +74,45 @@ function shouldBlockNetworkCommand(command: string): boolean {
 		/https?:\/\//i,
 	];
 	return patterns.some((pattern) => pattern.test(command));
+}
+
+function stripQuotedStrings(command: string): string {
+	return command.replace(/'[^']*'|"([^"\\]|\\.)*"/g, "");
+}
+
+function commandHasSingleTxtTarget(command: string): boolean {
+	if (/[*?[\]{}]/.test(command)) return false;
+	if (/\b(?:xargs|find)\b/.test(command)) return false;
+	if (/\s-(?:[A-Za-z]*[rR][A-Za-z]*)(?:\s|$)/.test(command)) return false;
+	const targets = Array.from(command.matchAll(/(?:^|\s)(\.?\/?[^\s|;&()<>]+\.txt)(?=\s|$)/g)).map((match) => match[1]);
+	return new Set(targets).size === 1;
+}
+
+function shouldBlockCrossDocSearchCommand(command: string): boolean {
+	if (process.env.DCI_BASH_BLOCK_CROSS_DOC_SEARCH !== "1") return false;
+	const normalized = command.replace(/\\\n/g, " ").replace(/\s+/g, " ").trim();
+	const withoutQuoted = stripQuotedStrings(normalized);
+	if (/\bfind\s+(?:\.|\/|\$PWD|`pwd`)/.test(withoutQuoted)) return true;
+	if (/\bls\b[\s\S]*(?:\|\s*(?:grep|rg|awk|sed)|\*\.(?:txt|md|html)|-R\b)/.test(withoutQuoted)) return true;
+	if (/\b(?:rg|grep)\b/.test(withoutQuoted)) {
+		if (
+			/\b(?:rg|grep)\b[\s\S]*(?:\*\.(?:txt|md|html)|\s\.\s*(?:[|;&)]|$)|\s\.\s+-|\s-r\b|\s-R\b|\s--recursive\b|\bxargs\b)/.test(
+				withoutQuoted,
+			)
+		) {
+			return true;
+		}
+		return !commandHasSingleTxtTarget(withoutQuoted);
+	}
+	if (/\bpython3?\b|\bnode\b/.test(withoutQuoted)) {
+		return /\b(?:os\.walk|glob\.glob|rglob|Path\([^)]*\)\.glob|readdirSync|findSync)\b|[*]\.txt/.test(normalized);
+	}
+	return false;
+}
+
+function webTerminalToolsEnabled(): boolean {
+	const raw = process.env.DCI_WEB_TERMINAL_TOOLS?.toLowerCase();
+	return raw === "1" || raw === "true" || raw === "yes";
 }
 
 function pullTerminalToolsEnabled(): boolean {
@@ -101,7 +158,87 @@ function splitShellWords(command: string): string[] | undefined {
 	return words;
 }
 
+type TerminalWebCommand =
+	| { kind: "search"; query: string; error?: string }
+	| { kind: "import"; resultId: string; goal?: string; error?: string };
+
 type TerminalPullCommand = { kind: "pull"; query: string; topK: number; error?: string };
+
+function parseTerminalWebCommand(command: string): TerminalWebCommand | undefined {
+	if (!webTerminalToolsEnabled()) return undefined;
+	const normalized = command.replace(/\\\n/g, " ").trim();
+	if (!/^(?:search|visit|import)\b/.test(normalized)) return undefined;
+	if (/[|;&<>`$()]/.test(normalized)) {
+		return {
+			kind: "search",
+			query: "",
+			error: "Invalid web search command. Use exactly `search \"query\"`; shell operators, pipes, redirects, and substitutions are not supported.",
+		};
+	}
+	const words = splitShellWords(normalized);
+	if (!words || words.length === 0) {
+		return {
+			kind: "search",
+			query: "",
+			error: "Invalid web search command. Use exactly `search \"query\"` with balanced quotes.",
+		};
+	}
+	const [program, ...args] = words;
+	if (program === "visit" || program === "import") {
+		const resultId = args[0];
+		if (!resultId) return undefined;
+		let goal: string | undefined;
+		for (let index = 1; index < args.length; index++) {
+			const arg = args[index]!;
+			if (arg === "--goal" || arg === "-g") {
+				const value = args[index + 1];
+				if (!value) {
+					return { kind: "import", resultId, error: "Invalid import command. Use `import <resultId> --goal \"focused evidence goal\"`." };
+				}
+				goal = value;
+				index++;
+				continue;
+			}
+			if (arg.startsWith("--goal=")) {
+				const value = arg.slice("--goal=".length).trim();
+				if (!value) {
+					return { kind: "import", resultId, error: "Invalid import command. Use `import <resultId> --goal \"focused evidence goal\"`." };
+				}
+				goal = value;
+				continue;
+			}
+			return {
+				kind: "import",
+				resultId,
+				error: "Invalid import command. Use `import <resultId> --goal \"focused evidence goal\"`.",
+			};
+		}
+		if (!goal) {
+			return {
+				kind: "import",
+				resultId,
+				error: "Import requires a focused evidence goal. Use `import <resultId> --goal \"what evidence to verify\"`.",
+			};
+		}
+		return { kind: "import", resultId, goal };
+	}
+	if (program !== "search") return undefined;
+	const queryParts: string[] = [];
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index]!;
+		if (arg === "--topK" || arg === "--top-k" || arg === "-k" || arg === "--pages" || arg === "-p") {
+			return {
+				kind: "search",
+				query: "",
+				error: "Search depth is fixed for this run. Use exactly `search \"query\"`; each search returns the top 10 candidates.",
+			};
+		}
+		queryParts.push(arg);
+	}
+	const query = queryParts.join(" ").replace(/\s+/g, " ").trim();
+	if (!query) return undefined;
+	return { kind: "search", query };
+}
 
 function parseTerminalPullCommand(command: string): TerminalPullCommand | undefined {
 	if (!pullTerminalToolsEnabled()) return undefined;
@@ -134,7 +271,7 @@ function parseTerminalPullCommand(command: string): TerminalPullCommand | undefi
 		if (arg === "--query" || arg === "-q") {
 			const value = args[index + 1];
 			if (!value) {
-				return { kind: "pull", query: "", topK: 0, error: "pull requires a non-empty query after --query." };
+				return { kind: "pull", query: "", topK: 0, error: 'pull requires a non-empty query after --query.' };
 			}
 			query = value;
 			index++;
@@ -174,17 +311,34 @@ function parseTerminalPullCommand(command: string): TerminalPullCommand | undefi
 	if (!query && positional.length > 0) query = positional.join(" ");
 	query = query.replace(/\s+/g, " ").trim();
 	if (!query) {
-		return {
-			kind: "pull",
-			query: "",
-			topK: 0,
-			error: 'pull requires a query. Use `pull --query "query terms" --topK 600`.',
-		};
+		return { kind: "pull", query: "", topK: 0, error: 'pull requires a query. Use `pull --query "query terms" --topK 600`.' };
 	}
 	if (!Number.isFinite(topK) || topK === undefined) {
 		return { kind: "pull", query, topK: 0, error: "pull requires an integer topK, for example `--topK 600`." };
 	}
 	return { kind: "pull", query, topK };
+}
+
+async function executeTerminalWebCommand(
+	cwd: string,
+	parsed: TerminalWebCommand,
+	signal?: AbortSignal,
+): Promise<{ content: Array<{ type: "text"; text: string }>; details: undefined }> {
+	if (parsed.kind === "search" && parsed.error) {
+		return { content: [{ type: "text", text: parsed.error }], details: undefined };
+	}
+	if (parsed.kind === "import" && parsed.error) {
+		return { content: [{ type: "text", text: parsed.error }], details: undefined };
+	}
+	const tool =
+		parsed.kind === "search" ? createWebSearchToolDefinition(cwd) : createWebFetchToolDefinition(cwd);
+	const params =
+		parsed.kind === "search"
+			? { query: parsed.query, topK: 10 }
+			: { resultId: parsed.resultId, ...(parsed.goal ? { goal: parsed.goal } : {}) };
+	const result = await tool.execute(`terminal-${parsed.kind}`, params, signal, undefined, undefined as any);
+	const text = getTextOutput(result as any, false) || "(no output)";
+	return { content: [{ type: "text", text }], details: undefined };
 }
 
 async function executeTerminalPullCommand(
@@ -196,13 +350,7 @@ async function executeTerminalPullCommand(
 		return { content: [{ type: "text", text: parsed.error }], details: undefined };
 	}
 	const tool = createPullToolDefinition(cwd);
-	const result = await tool.execute(
-		"terminal-pull",
-		{ query: parsed.query, topK: parsed.topK },
-		signal,
-		undefined,
-		undefined as any,
-	);
+	const result = await tool.execute("terminal-pull", { query: parsed.query, topK: parsed.topK }, signal, undefined, undefined as any);
 	const text = getTextOutput(result as any, false) || "(no output)";
 	return { content: [{ type: "text", text }], details: (result as any).details };
 }
@@ -446,23 +594,48 @@ export function createBashToolDefinition(
 		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Commands are capped by the harness timeout. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first), and individual long lines are shortened to ${BASH_MAX_LINE_LENGTH} chars. If output is truncated, refine the command or use read with offset/charOffset.`,
 		promptSnippet: pullTerminalToolsEnabled()
 			? 'Execute bash commands (ls, grep, find, etc.); also supports corpus retrieval with `pull --query "query terms" --topK 600`.'
+			: webTerminalToolsEnabled()
+			? "Execute bash commands (ls, grep, find, etc.); also supports Google web search with `search \"query\"` and page import with `import resultId --goal \"focused evidence goal\"`."
 			: "Execute bash commands (ls, grep, find, etc.)",
 		parameters: bashSchema,
 		async execute(_toolCallId, { command }: { command: string }, signal?: AbortSignal, onUpdate?, _ctx?) {
+			if (process.env.DCI_STRIP_ABSOLUTE_PULL_VIEW_CD === "1") {
+				command = command.replace(
+					/^\s*cd\s+(?:"[^"]*\/_pull_views\/[^"]*"|'[^']*\/_pull_views\/[^']*'|\/\S*\/_pull_views\/\S+)\s*(?:&&|;)\s*/s,
+					"",
+				);
+			}
 			const budget = await recordBudgetEvent(cwd, "bash");
 			if (budget.blocked) {
 				return { content: [{ type: "text", text: budget.blocked }], details: undefined };
+			}
+			const terminalWebCommand = parseTerminalWebCommand(command);
+			if (terminalWebCommand) {
+				return executeTerminalWebCommand(cwd, terminalWebCommand, signal);
 			}
 			const terminalPullCommand = parseTerminalPullCommand(command);
 			if (terminalPullCommand) {
 				return executeTerminalPullCommand(cwd, terminalPullCommand, signal);
 			}
 			if (shouldBlockNetworkCommand(command)) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: webTerminalToolsEnabled()
+									? "Network access is disabled for ordinary bash commands in this isolated environment. Use `search \"query\"` for web search and `import resultId --goal \"focused evidence goal\"` to open pages; use bash only on local files."
+									: "Network access is disabled for bash in this isolated environment. Use pull(query) for web search and import(resultId) to download pages; use bash only on local files.",
+							},
+						],
+					details: undefined,
+				};
+			}
+			if (shouldBlockCrossDocSearchCommand(command)) {
 				return {
 					content: [
 						{
 							type: "text",
-							text: 'Network access is disabled for bash in this isolated environment. Use `pull --query "query terms" --topK N` to retrieve corpus documents; use bash only on local files.',
+							text: "Forbidden: broad multi-file search is disabled for this run. You may inspect a specific file with read, or run rg/grep/sed/head/tail/cat against one explicit file path.",
 						},
 					],
 					details: undefined,
@@ -504,7 +677,7 @@ export function createBashToolDefinition(
 					// Stream partial output using the rolling tail buffer.
 					if (onUpdate) {
 						const fullBuffer = Buffer.concat(chunks);
-						const fullText = fullBuffer.toString("utf-8");
+						const fullText = sanitizeBashOutputForModel(fullBuffer.toString("utf-8"), spawnContext.cwd);
 						const lineClamp = clampLongLines(fullText, {
 							command: spawnContext.command,
 						});
@@ -531,8 +704,9 @@ export function createBashToolDefinition(
 						// Combine the rolling buffer chunks.
 						const fullBuffer = Buffer.concat(chunks);
 						const fullOutput = fullBuffer.toString("utf-8");
+						const modelOutput = sanitizeBashOutputForModel(fullOutput, spawnContext.cwd);
 						// Apply tail truncation for the final display payload.
-						const lineClamp = clampLongLines(fullOutput, {
+						const lineClamp = clampLongLines(modelOutput, {
 							command: spawnContext.command,
 						});
 						if (lineClamp.clamped && !tempFilePath) {
@@ -548,7 +722,7 @@ export function createBashToolDefinition(
 							? { fullOutputPath: tempFilePath }
 							: undefined;
 						if (lineClamp.clamped) {
-							outputText += `\n\n[${lineClamp.clampedLines} long line(s) clipped; full=${tempFilePath}]`;
+							outputText += `\n\n[${lineClamp.clampedLines} long line(s) clipped; full output saved outside model context]`;
 						}
 						if (truncation.truncated) {
 							// Build truncation details and an actionable notice.
@@ -557,12 +731,12 @@ export function createBashToolDefinition(
 							const endLine = truncation.totalLines;
 							if (truncation.lastLinePartial) {
 								// Edge case: the last line alone is larger than the byte limit.
-								const lastLineSize = formatSize(Buffer.byteLength(fullOutput.split("\n").pop() || "", "utf-8"));
-								outputText += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). Full output: ${tempFilePath}]`;
+								const lastLineSize = formatSize(Buffer.byteLength(modelOutput.split("\n").pop() || "", "utf-8"));
+								outputText += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). Full output saved outside model context.]`;
 							} else if (truncation.truncatedBy === "lines") {
-								outputText += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. Full output: ${tempFilePath}]`;
+								outputText += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. Full output saved outside model context.]`;
 							} else {
-								outputText += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Full output: ${tempFilePath}]`;
+								outputText += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Full output saved outside model context.]`;
 							}
 						}
 						if (exitCode !== 0 && exitCode !== null) {
@@ -576,7 +750,7 @@ export function createBashToolDefinition(
 						// Close temp file stream and include buffered output in the error message.
 						if (tempFileStream) tempFileStream.end();
 						const fullBuffer = Buffer.concat(chunks);
-						let output = fullBuffer.toString("utf-8");
+						let output = sanitizeBashOutputForModel(fullBuffer.toString("utf-8"), spawnContext.cwd);
 						if (err.message === "aborted") {
 							if (output) output += "\n\n";
 							output += "Command aborted";

@@ -37,7 +37,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 		skills: providedSkills,
 	} = options;
 	const resolvedCwd = cwd ?? process.cwd();
-	const promptCwd = resolvedCwd.replace(/\\/g, "/");
+	const promptCwd = (process.env.PI_DISPLAY_CWD || resolvedCwd).replace(/\\/g, "/");
 
 	const date = new Date().toISOString().slice(0, 10);
 

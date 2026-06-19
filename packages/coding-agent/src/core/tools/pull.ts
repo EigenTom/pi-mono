@@ -53,6 +53,7 @@ type PullMaterializationMode =
 	| "flat_disclosed"
 	| "root_flat_disclosed"
 	| "root_qprefix_disclosed";
+type PullPreviewMode = "ranked" | "shuffled" | "hidden";
 
 type MaterializedDocument = {
 	sourcePath: string;
@@ -75,6 +76,45 @@ function readBoundedPositiveIntEnv(name: string, fallback: number, min: number, 
 	return Math.max(min, Math.min(max, value));
 }
 
+function parsePullPreviewMode(raw: string | undefined): PullPreviewMode {
+	if (raw === "shuffled" || raw === "hidden") return raw;
+	return "ranked";
+}
+
+function stableHash(value: string): number {
+	let hash = 2166136261;
+	for (let i = 0; i < value.length; i++) {
+		hash ^= value.charCodeAt(i);
+		hash = Math.imul(hash, 16777619);
+	}
+	return hash >>> 0;
+}
+
+function previewDocumentKey(doc: MaterializedDocument): string {
+	return `${doc.sourcePath}\u0000${doc.workspacePath}\u0000${doc.rank}\u0000${doc.score}`;
+}
+
+function buildAgentVisiblePreview(
+	documents: MaterializedDocument[],
+	mode: PullPreviewMode,
+	pullIndex: number,
+	limit: number,
+): MaterializedDocument[] {
+	if (mode === "hidden") return [];
+	if (mode === "ranked") return documents.slice(0, limit);
+	return documents
+		.map((doc, index) => ({
+			doc,
+			sortKey: stableHash(`${pullIndex}\u0000${index}\u0000${previewDocumentKey(doc)}`),
+		}))
+		.sort((a, b) => a.sortKey - b.sortKey)
+		.slice(0, limit)
+		.map(({ doc }, index) => ({
+			...doc,
+			rank: index + 1,
+		}));
+}
+
 export interface PullToolDetails {
 	toolKind: "pull";
 	queries: string[];
@@ -92,6 +132,7 @@ export interface PullToolDetails {
 	materializedDocumentCount: number;
 	missingDocumentCount: number;
 	alreadyVisibleDocumentCount?: number;
+	previewMode?: PullPreviewMode;
 	topNewDocuments?: MaterializedDocument[];
 	perQueryHitCounts: Record<string, number>;
 	queryDirs: Record<string, string>;
@@ -290,10 +331,7 @@ async function materializeText(args: { text: string; targetPath: string; ops: Pu
 		const firstNewline = text.indexOf("\n");
 		const secondNewline = firstNewline >= 0 ? text.indexOf("\n", firstNewline + 1) : -1;
 		const minBytes = readPositiveIntEnv("DCI_REFLOW_SINGLE_LINE_MIN_BYTES");
-		if (
-			(firstNewline < 0 || secondNewline < 0) &&
-			(minBytes === undefined || Buffer.byteLength(text, "utf8") >= minBytes)
-		) {
+		if ((firstNewline < 0 || secondNewline < 0) && (minBytes === undefined || Buffer.byteLength(text, "utf8") >= minBytes)) {
 			await ops.writeFile(targetPath, reflowLongLineText(text, width));
 			return;
 		}
@@ -577,14 +615,14 @@ export function createPullToolDefinition(cwd: string, options?: PullToolOptions)
 			? process.env.DCI_PULL_PROMPT_MODE
 			: "default";
 	const materializationMode = parsePullMaterializationMode(process.env.DCI_PULL_MATERIALIZATION_MODE);
+	const previewMode = parsePullPreviewMode(process.env.DCI_PULL_PREVIEW_MODE);
 	const previewLimit = readBoundedPositiveIntEnv("DCI_PULL_PREVIEW_LIMIT", 20, 1, 100);
-	const rankAwareMode =
-		promptMode === "rank_aware" || promptMode === "bm25_aware" || materializationMode !== "original";
+	const rankAwareMode = promptMode === "rank_aware" || promptMode === "bm25_aware" || materializationMode !== "original";
 	const discloseNewDocs =
 		materializationMode === "flat_disclosed" ||
 		materializationMode === "root_flat_disclosed" ||
 		materializationMode === "root_qprefix_disclosed";
-	const disclosePreview = discloseNewDocs;
+	const disclosePreview = discloseNewDocs && previewMode !== "hidden";
 	const harnessTopK = readPositiveIntEnv("DCI_PULL_TOP_K");
 	const rankAwareMinTopK = readBoundedPositiveIntEnv("DCI_PULL_MIN_TOP_K", 300, 1, 10_000);
 	const rankAwareMaxTopK = Math.max(
@@ -660,8 +698,7 @@ export function createPullToolDefinition(cwd: string, options?: PullToolOptions)
 			: promptMode === "bm25_aware"
 				? `It accepts one query string consisting of exact keywords and short phrases per call and required topK ${topKRangeText}.`
 				: `It accepts one query string per call and required topK ${topKRangeText}.`;
-	const retrievalVerb =
-		promptMode === "bm25_aware" ? "retrieves matching documents" : "retrieves semantically relevant documents";
+	const retrievalVerb = promptMode === "bm25_aware" ? "retrieves matching documents" : "retrieves semantically relevant documents";
 	const folderDescription =
 		layout === "root"
 			? rankAwareMode
@@ -704,7 +741,9 @@ export function createPullToolDefinition(cwd: string, options?: PullToolOptions)
 							: "Rank-aware mode accepts one query string and topK; call pull again for a different clue.",
 					disclosePreview
 						? "The tool result shows retrieval ranks for newly added documents; lower numbers are more similar."
-						: "Rank prefixes indicate retrieval order within that query; lower numbers are more similar.",
+						: discloseNewDocs
+							? "The tool result reports workspace expansion counts. It does not show ranked document previews."
+							: "Rank prefixes indicate retrieval order within that query; lower numbers are more similar.",
 				]
 			: []),
 		...(layout === "pull"
@@ -823,7 +862,7 @@ export function createPullToolDefinition(cwd: string, options?: PullToolOptions)
 			const perQueryHitCounts = Object.fromEntries(
 				Object.entries(perQueryHits).map(([query, hits]) => [query, hits.length]),
 			);
-			const agentVisiblePreview = topNewDocuments.slice(0, previewLimit);
+			const agentVisiblePreview = buildAgentVisiblePreview(topNewDocuments, previewMode, pullIndex, previewLimit);
 			const details: PullToolDetails = {
 				toolKind: "pull",
 				queries: effectiveQueries,
@@ -831,6 +870,7 @@ export function createPullToolDefinition(cwd: string, options?: PullToolOptions)
 				viewMode: "hardlink",
 				layout,
 				materializationMode,
+				previewMode,
 				viewDir,
 				pullIndex,
 				pullDir,
@@ -851,11 +891,19 @@ export function createPullToolDefinition(cwd: string, options?: PullToolOptions)
 					? [
 							layout === "root" ? "Workspace root expanded." : `Workspace expanded under ./${workspaceDir}.`,
 							`New documents added: ${materializedDocumentCount}. Already visible from previous pulls: ${alreadyVisibleDocumentCount}.`,
-							"Top newly added documents by retrieval rank:",
-							...(previewLines.length > 0 ? previewLines : ["- none"]),
+							...(previewMode === "hidden"
+								? ["Document rank preview hidden for this run."]
+								: [
+										"Top newly added documents by retrieval rank:",
+										...(previewLines.length > 0 ? previewLines : ["- none"]),
+									]),
 							layout === "root"
-								? "Search/read the workspace root with local tools. Ranks are shown here only; filenames are not rank-prefixed."
-								: "Search/read the workspace with local tools. Ranks are shown here only; filenames are not rank-prefixed.",
+								? previewMode === "hidden"
+									? "Search/read the workspace root with local tools. Filenames are not rank-prefixed."
+									: "Search/read the workspace root with local tools. Ranks are shown here only; filenames are not rank-prefixed."
+								: previewMode === "hidden"
+									? "Search/read the workspace with local tools. Filenames are not rank-prefixed."
+									: "Search/read the workspace with local tools. Ranks are shown here only; filenames are not rank-prefixed.",
 						].join("\n")
 					: undefined;
 
