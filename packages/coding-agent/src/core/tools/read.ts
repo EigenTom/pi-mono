@@ -120,6 +120,24 @@ function trimTrailingEmptyLines(lines: string[]): string[] {
 	return lines.slice(0, end);
 }
 
+function sanitizeReadErrorForModel(error: any, requestedPath: string, absolutePath: string, cwd: string): string {
+	const displayPath = requestedPath.startsWith("/") ? requestedPath : `./${requestedPath.replace(/^\.?\//, "")}`;
+	const code = typeof error?.code === "string" ? error.code : "";
+	if (code === "ENOENT") return `File not found: ${displayPath}`;
+	if (code === "EACCES" || code === "EPERM") return `File is not readable: ${displayPath}`;
+	const rawMessage = String(error?.message || error || "read failed");
+	const displayCwd = process.env.PI_DISPLAY_CWD;
+	let message = rawMessage.split(absolutePath).join(displayPath);
+	if (displayCwd !== undefined) {
+		const normalizedCwd = cwd.replace(/\/+$/, "");
+		if (normalizedCwd && normalizedCwd !== "/") {
+			const replacement = displayCwd.replace(/\/+$/, "") || ".";
+			message = message.split(`${normalizedCwd}/`).join(`${replacement}/`).split(normalizedCwd).join(replacement);
+		}
+	}
+	return `Read failed for ${displayPath}: ${message}`;
+}
+
 function formatReadResult(
 	args:
 		| { path?: string; file_path?: string; offset?: number; limit?: number; charOffset?: number; charLimit?: number }
@@ -361,7 +379,12 @@ export function createReadToolDefinition(
 							resolve({ content, details });
 						} catch (error: any) {
 							signal?.removeEventListener("abort", onAbort);
-							if (!aborted) reject(error);
+							if (!aborted) {
+								resolve({
+									content: [{ type: "text", text: sanitizeReadErrorForModel(error, path, absolutePath, cwd) }],
+									details: undefined,
+								});
+							}
 						}
 					})();
 				},

@@ -18,6 +18,70 @@
 					"maxTokens": 4096
 				}
 			]
+		},
+		"openrouter-zai": {
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"api": "openai-completions",
+			"apiKey": "OPENROUTER_API_KEY",
+			"compat": {
+				"supportsDeveloperRole": false,
+				"thinkingFormat": "openrouter",
+				"openRouterRouting": {
+					"only": [
+						"z-ai/fp8"
+					]
+				}
+			},
+			"models": [
+				{
+					"id": "z-ai/glm-5.2",
+					"name": "GLM-5.2 via OpenRouter Z.AI FP8",
+					"reasoning": true,
+					"contextWindow": 262144,
+					"maxTokens": 8192
+				}
+			]
+		},
+		"openrouter-deepseek": {
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"api": "openai-completions",
+			"apiKey": "OPENROUTER_API_KEY",
+			"compat": {
+				"supportsDeveloperRole": false,
+				"thinkingFormat": "openrouter",
+				"openRouterRouting": {
+					"only": [
+						"deepseek"
+					]
+				}
+			},
+			"models": [
+				{
+					"id": "deepseek/deepseek-v4-flash",
+					"name": "DeepSeek V4 Flash via OpenRouter DeepSeek",
+					"reasoning": true,
+					"contextWindow": 262144,
+					"maxTokens": 8192
+				}
+			]
+		},
+		"lcpu-glm": {
+			"baseUrl": "https://llmapi-ext.lcpu.dev/v1",
+			"api": "openai-completions",
+			"apiKey": "LCPU_GLM_API_KEY",
+			"compat": {
+				"supportsDeveloperRole": false,
+				"supportsReasoningEffort": false
+			},
+			"models": [
+				{
+					"id": "GLM-5.2",
+					"name": "GLM-5.2 via lcpu.dev",
+					"reasoning": true,
+					"contextWindow": 262144,
+					"maxTokens": 8192
+				}
+			]
 		}
 	}
 }

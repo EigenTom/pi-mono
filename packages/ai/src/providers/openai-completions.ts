@@ -87,11 +87,23 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
 			const client = createClient(model, context, apiKey, options?.headers);
 			let params = buildParams(model, context, options);
+			const disableStreaming = shouldDisableStreaming();
+			if (disableStreaming) {
+				(params as any).stream = false;
+				delete (params as any).stream_options;
+			}
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
 				params = nextParams as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming;
 			}
-			const openaiStream = await client.chat.completions.create(params, { signal: options?.signal });
+			if (disableStreaming) {
+				await completeOpenAICompletionsNonStreaming(client, params, output, stream, model, options);
+				return;
+			}
+			const openaiStream = await withRequestRetries(
+				() => client.chat.completions.create(params, { signal: options?.signal }),
+				options?.signal,
+			);
 			stream.push({ type: "start", partial: output });
 
 			let currentBlock: TextContent | ThinkingContent | (ToolCall & { partialArgs?: string }) | null = null;
@@ -291,7 +303,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 		} catch (error) {
 			for (const block of output.content) delete (block as any).index;
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
+			output.errorMessage = formatProviderError(error);
 			// Some providers via OpenRouter give additional information in this field.
 			const rawMetadata = (error as any)?.error?.metadata?.raw;
 			if (rawMetadata) output.errorMessage += `\n${rawMetadata}`;
@@ -302,6 +314,212 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 
 	return stream;
 };
+
+async function completeOpenAICompletionsNonStreaming(
+	client: OpenAI,
+	params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming,
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	model: Model<"openai-completions">,
+	options?: OpenAICompletionsOptions,
+) {
+	const nonStreamingParams = { ...(params as any), stream: false };
+	delete nonStreamingParams.stream_options;
+	const completion = await withRequestRetries(async () => {
+		const completion = await client.chat.completions.create(nonStreamingParams, { signal: options?.signal });
+		assertNonStreamingCompletionIsRetryableOrUsable(completion);
+		return completion;
+	}, options?.signal);
+	stream.push({ type: "start", partial: output });
+	output.responseId ||= (completion as any).id;
+	if ((completion as any).usage) {
+		output.usage = parseChunkUsage((completion as any).usage, model);
+	}
+	const choice = Array.isArray((completion as any).choices) ? (completion as any).choices[0] : undefined;
+	const message = choice?.message;
+	if (choice?.finish_reason) {
+		const finishReasonResult = mapStopReason(choice.finish_reason);
+		output.stopReason = finishReasonResult.stopReason;
+		if (finishReasonResult.errorMessage) output.errorMessage = finishReasonResult.errorMessage;
+	}
+	if (message) {
+		appendNonStreamingMessageContent(message, output, stream);
+	}
+	if (options?.signal?.aborted) {
+		throw new Error("Request was aborted");
+	}
+	if (output.stopReason === "aborted") {
+		throw new Error("Request was aborted");
+	}
+	if (output.stopReason === "error") {
+		throw new Error(output.errorMessage || "Provider returned an error stop reason");
+	}
+	stream.push({ type: "done", reason: output.stopReason, message: output });
+	stream.end();
+}
+
+function appendNonStreamingMessageContent(
+	message: OpenAI.Chat.Completions.ChatCompletionMessage,
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+) {
+	const blockIndex = () => output.content.length - 1;
+	const reasoningFields = ["reasoning_content", "reasoning", "reasoning_text"];
+	for (const field of reasoningFields) {
+		const reasoning = (message as any)[field];
+		if (typeof reasoning === "string" && reasoning.length > 0) {
+			const block: ThinkingContent = { type: "thinking", thinking: reasoning, thinkingSignature: field };
+			output.content.push(block);
+			stream.push({ type: "thinking_start", contentIndex: blockIndex(), partial: output });
+			stream.push({ type: "thinking_delta", contentIndex: blockIndex(), delta: reasoning, partial: output });
+			stream.push({ type: "thinking_end", contentIndex: blockIndex(), content: reasoning, partial: output });
+			break;
+		}
+	}
+
+	if (typeof message.content === "string" && message.content.length > 0) {
+		const block: TextContent = { type: "text", text: message.content };
+		output.content.push(block);
+		stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
+		stream.push({ type: "text_delta", contentIndex: blockIndex(), delta: message.content, partial: output });
+		stream.push({ type: "text_end", contentIndex: blockIndex(), content: message.content, partial: output });
+	}
+
+	if (Array.isArray(message.tool_calls)) {
+		for (const toolCall of message.tool_calls) {
+			const functionCall = (toolCall as any).function;
+			const block: ToolCall = {
+				type: "toolCall",
+				id: toolCall.id || "",
+				name: functionCall?.name || "",
+				arguments: parseStreamingJson(functionCall?.arguments || ""),
+			};
+			output.content.push(block);
+			stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output });
+			stream.push({
+				type: "toolcall_delta",
+				contentIndex: blockIndex(),
+				delta: functionCall?.arguments || "",
+				partial: output,
+			});
+			stream.push({ type: "toolcall_end", contentIndex: blockIndex(), toolCall: block, partial: output });
+		}
+	}
+}
+
+function shouldDisableStreaming(): boolean {
+	return /^(1|true|yes)$/i.test(process.env.DCI_OPENAI_COMPLETIONS_DISABLE_STREAM || "");
+}
+
+function assertNonStreamingCompletionIsRetryableOrUsable(completion: OpenAI.Chat.Completions.ChatCompletion): void {
+	const choice = Array.isArray((completion as any).choices) ? (completion as any).choices[0] : undefined;
+	const finishReason = choice?.finish_reason;
+	if (!finishReason) return;
+	const mapped = mapStopReason(finishReason);
+	if (mapped.stopReason !== "error") return;
+	const error = new Error(mapped.errorMessage || `Provider finish_reason: ${finishReason}`);
+	(error as Error & { status?: number }).status = finishReason === "content_filter" ? 409 : 500;
+	throw error;
+}
+
+async function withRequestRetries<T>(request: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+	const maxRetries = Math.max(0, Number.parseInt(process.env.DCI_OPENAI_COMPLETIONS_MAX_RETRIES || "0", 10) || 0);
+	const baseDelayMs = Math.max(
+		0,
+		Number.parseInt(process.env.DCI_OPENAI_COMPLETIONS_RETRY_BASE_MS || "1000", 10) || 1000,
+	);
+	const maxDelayMs = Math.max(
+		baseDelayMs,
+		Number.parseInt(process.env.DCI_OPENAI_COMPLETIONS_RETRY_MAX_MS || "60000", 10) || 60000,
+	);
+	let attempt = 0;
+	while (true) {
+		try {
+			return await request();
+		} catch (error) {
+			if (signal?.aborted || attempt >= maxRetries) {
+				throw error;
+			}
+			attempt += 1;
+			const message = formatProviderError(error);
+			if (!shouldRetryProviderError(error, message)) {
+				throw error;
+			}
+			const exponential = Math.min(maxDelayMs, baseDelayMs * 2 ** Math.min(attempt - 1, 6));
+			const jitter = Math.floor(Math.random() * Math.max(1, Math.floor(exponential * 0.25)));
+			const delayMs = Math.min(maxDelayMs, exponential + jitter);
+			console.warn(`[openai-completions] request retry ${attempt}/${maxRetries} after ${delayMs}ms: ${message}`);
+			await sleep(delayMs, signal);
+		}
+	}
+}
+
+function shouldRetryProviderError(error: unknown, formatted: string): boolean {
+	const err = error as { status?: number; code?: string; name?: string };
+	const status = Number(err?.status || 0);
+	const text = formatted.toLowerCase();
+	if (
+		status === 400 &&
+		["content exists risk", "content risk", "risk control", "safety risk", "sensitive content"].some((needle) =>
+			text.includes(needle),
+		)
+	) {
+		return true;
+	}
+	if (status === 400 || status === 401 || status === 403 || status === 404) {
+		return false;
+	}
+	if (status === 408 || status === 409 || status === 425 || status === 429 || status >= 500) {
+		return true;
+	}
+	return [
+		"content_filter",
+		"content filter",
+		"econnreset",
+		"etimedout",
+		"econnrefused",
+		"socket hang up",
+		"terminated",
+		"timeout",
+		"rate limit",
+		"temporarily unavailable",
+		"overloaded",
+		"internal server error",
+		"bad gateway",
+		"service unavailable",
+		"gateway timeout",
+	].some((needle) => text.includes(needle));
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+	if (ms <= 0) return Promise.resolve();
+	return new Promise((resolve, reject) => {
+		const timeout = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		const onAbort = () => {
+			clearTimeout(timeout);
+			reject(new Error("Request was aborted"));
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+function formatProviderError(error: unknown): string {
+	if (!(error instanceof Error)) return JSON.stringify(error);
+	const parts = [error.message || error.name || "Provider error"];
+	const err = error as Error & { code?: string; status?: number; cause?: unknown };
+	if (err.name && err.name !== "Error") parts.push(`name=${err.name}`);
+	if (err.code) parts.push(`code=${err.code}`);
+	if (err.status) parts.push(`status=${err.status}`);
+	if (err.cause !== undefined) {
+		parts.push(
+			`cause=${err.cause instanceof Error ? `${err.cause.name}: ${err.cause.message}` : JSON.stringify(err.cause)}`,
+		);
+	}
+	return parts.join(" | ");
+}
 
 export const streamSimpleOpenAICompletions: StreamFunction<"openai-completions", SimpleStreamOptions> = (
 	model: Model<"openai-completions">,
