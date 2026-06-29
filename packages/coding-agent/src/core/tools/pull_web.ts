@@ -28,10 +28,12 @@ const webPullSchema = Type.Object({
 });
 
 const webSearchSchema = Type.Object({
-	query: Type.Optional(Type.String({
-		minLength: 1,
-		description: "One concise external-database query. Provide query or queries.",
-	})),
+	query: Type.Optional(
+		Type.String({
+			minLength: 1,
+			description: "One concise external-database query. Provide query or queries.",
+		}),
+	),
 	queries: Type.Optional(
 		Type.Array(
 			Type.String({
@@ -834,7 +836,11 @@ const DISCOVERY_STOPWORDS = new Set([
 ]);
 
 function normalizeDiscoveryText(value: string): string {
-	return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
+	return value
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
 }
 
 function addDiscoveryClue(clues: string[], seen: Set<string>, clue: string): void {
@@ -886,7 +892,9 @@ function candidateContainsClue(candidateText: string, clue: string): boolean {
 
 function scoreCandidateClues(hit: SearchHit, query: string): CandidateClueScore {
 	const clues = extractDiscoveryClues(query);
-	const candidateText = normalizeDiscoveryText([hit.title, hit.description, domainFromUrl(hit.url), hit.url].join(" "));
+	const candidateText = normalizeDiscoveryText(
+		[hit.title, hit.description, domainFromUrl(hit.url), hit.url].join(" "),
+	);
 	const matchedClues = clues.filter((clue) => candidateContainsClue(candidateText, clue)).slice(0, 12);
 	const rareMatches = matchedClues.filter(isRareDiscoveryClue).slice(0, 8);
 	const rankPrior = Math.max(0, 1 - (hit.rank - 1) / 100);
@@ -915,7 +923,9 @@ function escapeRegExp(value: string): string {
 }
 
 function findGoalEvidenceWindows(content: string, goal: string, maxWindows = 4): GoalEvidenceWindow[] {
-	const clues = extractDiscoveryClues(goal).filter((clue) => normalizeDiscoveryText(clue).length >= 3).slice(0, 18);
+	const clues = extractDiscoveryClues(goal)
+		.filter((clue) => normalizeDiscoveryText(clue).length >= 3)
+		.slice(0, 18);
 	if (clues.length === 0) return [];
 	const lines = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
 	const normalizedLines = lines.map(normalizeDiscoveryText);
@@ -972,10 +982,7 @@ function formatGoalEvidencePacket(content: string, filename: string, goal: strin
 	const cleanGoal = cleanPreviewText(goal, 260);
 	const clues = extractDiscoveryClues(goal).slice(0, 18);
 	const windows = findGoalEvidenceWindows(content, goal);
-	const lines = [
-		`Goal: ${cleanGoal}`,
-		`Goal-derived anchors: ${formatClueList(clues)}`,
-	];
+	const lines = [`Goal: ${cleanGoal}`, `Goal-derived anchors: ${formatClueList(clues)}`];
 	if (windows.length === 0) {
 		lines.push(
 			"Goal-focused lexical scan: no direct anchor windows found in the imported full text.",
@@ -1022,7 +1029,8 @@ function normalizePullQueries(params: WebSearchExecuteInput): string[] {
 		deduped.push(query);
 	}
 	if (deduped.length === 0) throw new Error("At least one non-empty query is required");
-	if (deduped.length > 5) throw new Error(`Too many queries (${deduped.length}). pull accepts at most 5 queries per call.`);
+	if (deduped.length > 5)
+		throw new Error(`Too many queries (${deduped.length}). pull accepts at most 5 queries per call.`);
 	return deduped;
 }
 
@@ -1048,7 +1056,9 @@ function suggestedCandidateImports(
 		...suggested.map((row) => {
 			const rankText = previewMode === "hidden" ? "" : `#${row.rank} `;
 			const duplicateText = row.duplicateOfPreviousPull ? " repeated" : "";
-			const matches = formatClueList(row.clueScore.rareMatches.length > 0 ? row.clueScore.rareMatches : row.clueScore.matchedClues);
+			const matches = formatClueList(
+				row.clueScore.rareMatches.length > 0 ? row.clueScore.rareMatches : row.clueScore.matchedClues,
+			);
 			return `- ${rankText}${row.resultId} ${row.workspacePath}${duplicateText} -- matches: ${matches}`;
 		}),
 	];
@@ -1379,10 +1389,20 @@ export function createWebSearchToolDefinition(
 	const candidatePreviewMode = webCandidatePreviewMode();
 	const maxSearchCalls = readPositiveIntEnv("DCI_WEB_SEARCH_MAX_CALLS");
 	const candidateMinTopK = readBoundedPositiveIntEnv("DCI_WEB_PULL_MIN_TOP_K", 10, 10, 100);
-	const candidateDefaultTopK = readBoundedPositiveIntEnv("DCI_WEB_CANDIDATE_DOC_TOP_K", candidateMinTopK, candidateMinTopK, 100);
+	const candidateDefaultTopK = readBoundedPositiveIntEnv(
+		"DCI_WEB_CANDIDATE_DOC_TOP_K",
+		candidateMinTopK,
+		candidateMinTopK,
+		100,
+	);
 	const candidateMaxTopK = Math.max(
 		candidateMinTopK,
-		readBoundedPositiveIntEnv("DCI_WEB_PULL_MAX_TOP_K", readBoundedPositiveIntEnv("DCI_WEB_CANDIDATE_DOC_MAX_TOP_K", 100, 10, 100), candidateMinTopK, 100),
+		readBoundedPositiveIntEnv(
+			"DCI_WEB_PULL_MAX_TOP_K",
+			readBoundedPositiveIntEnv("DCI_WEB_CANDIDATE_DOC_MAX_TOP_K", 100, 10, 100),
+			candidateMinTopK,
+			100,
+		),
 	);
 	const candidateFixedTopK = candidateMinTopK === candidateMaxTopK;
 
@@ -1392,23 +1412,23 @@ export function createWebSearchToolDefinition(
 		description:
 			mode === "candidate_docs"
 				? "Pull ranked search-result candidates for one or more external-database queries and materialize their titles/snippets as local pseudo-documents. Does not fetch page text."
-			: mode === "search_fetch"
-				? "Search Google for one query. Returns the top 10 ranked candidates with ids, titles, and matched snippets. Does not import document text."
-				: "Pull documents from an external document database and write the top readable results as local files. Accepts one concise query.",
+				: mode === "search_fetch"
+					? "Search Google for one query. Returns the top 10 ranked candidates with ids, titles, and matched snippets. Does not import document text."
+					: "Pull documents from an external document database and write the top readable results as local files. Accepts one concise query.",
 		promptSnippet:
 			mode === "candidate_docs"
 				? candidateFixedTopK
 					? `pull(query|queries) creates local search-result candidate previews from the top ${candidateFixedTopK ? candidateMinTopK : candidateDefaultTopK} search results per query and returns importable result IDs.`
 					: "pull(query|queries, topK) creates local search-result candidate previews and returns importable result IDs."
-			: mode === "search_fetch"
-				? "search(query) returns the top 10 ranked Google candidates with ids, titles, and matched snippets."
-				: "pull(query) writes readable external-database documents as local files.",
+				: mode === "search_fetch"
+					? "search(query) returns the top 10 ranked Google candidates with ids, titles, and matched snippets."
+					: "pull(query) writes readable external-database documents as local files.",
 		promptGuidelines: [
 			mode === "candidate_docs"
 				? "pull creates candidate previews from external search results; it does not fetch full page text."
-			: mode === "search_fetch"
-				? "search only returns titles, matched snippets, and candidate ids; it does not fetch page text."
-				: "pull adds local files for one query.",
+				: mode === "search_fetch"
+					? "search only returns titles, matched snippets, and candidate ids; it does not fetch page text."
+					: "pull adds local files for one query.",
 			mode === "candidate_docs" || mode === "search_fetch"
 				? mode === "search_fetch"
 					? "search returns ranked candidates with ids that can be imported."
@@ -1433,7 +1453,13 @@ export function createWebSearchToolDefinition(
 				mode === "candidate_docs"
 					? normalizePullQueries(params)
 					: mode === "search_fetch"
-						? [typeof params.query === "string" ? params.query.trim() : Array.isArray(params.queries) && typeof params.queries[0] === "string" ? params.queries[0].trim() : ""]
+						? [
+								typeof params.query === "string"
+									? params.query.trim()
+									: Array.isArray(params.queries) && typeof params.queries[0] === "string"
+										? params.queries[0].trim()
+										: "",
+							]
 						: [typeof params.query === "string" ? params.query.trim() : ""];
 			const query = queries[0] ?? "";
 			if (!query) throw new Error("A non-empty query string is required");
@@ -1506,7 +1532,9 @@ export function createWebSearchToolDefinition(
 					duplicateOfPreviousPull?: boolean;
 					clueScore: CandidateClueScore;
 				}> = search.hits.map((hit) => {
-					const sourceQuery = search.byQuery.find((item) => item.hits.some((candidate) => candidate.url === hit.url))?.query ?? query;
+					const sourceQuery =
+						search.byQuery.find((item) => item.hits.some((candidate) => candidate.url === hit.url))?.query ??
+						query;
 					return {
 						resultId: `c${hash(hit.url).slice(0, 8)}`,
 						searchIndex,
@@ -1605,7 +1633,9 @@ export function createWebSearchToolDefinition(
 								candidatePreviewMode === "hidden"
 									? "Ranking is hidden for this run. Result IDs and candidate file paths are still shown so you can import selected pages."
 									: "Merged ranked preview:",
-								...(previewLines.length > 0 ? previewLines : ["No candidates. Try a shorter exact-phrase query or a sharper clue."]),
+								...(previewLines.length > 0
+									? previewLines
+									: ["No candidates. Try a shorter exact-phrase query or a sharper clue."]),
 								...suggestedCandidateImports(resultRows, candidatePreviewMode),
 							].join("\n"),
 						},
@@ -1648,9 +1678,12 @@ export function createWebSearchToolDefinition(
 				await ops.mkdir(viewDir);
 				const topK = 10;
 				const search = await webSearchManyQueries({ queries, topK, cacheDir, ops, signal });
-				const budgetLine = maxSearchCalls === undefined ? undefined : `Search budget: up to ${maxSearchCalls} calls.`;
+				const budgetLine =
+					maxSearchCalls === undefined ? undefined : `Search budget: up to ${maxSearchCalls} calls.`;
 				const resultRows = search.hits.map((hit) => {
-					const sourceQuery = search.byQuery.find((item) => item.hits.some((candidate) => candidate.url === hit.url))?.query ?? query;
+					const sourceQuery =
+						search.byQuery.find((item) => item.hits.some((candidate) => candidate.url === hit.url))?.query ??
+						query;
 					return {
 						resultId: `c${hash(hit.url).slice(0, 8)}`,
 						searchIndex,
@@ -1670,7 +1703,11 @@ export function createWebSearchToolDefinition(
 							cleanPreviewText(hit.description) || "(no matched snippet)"
 						}`;
 					});
-					return [`Query: ${item.query}`, `Top ${rows.length} candidates:`, ...(rows.length > 0 ? rows : ["- none"])];
+					return [
+						`Query: ${item.query}`,
+						`Top ${rows.length} candidates:`,
+						...(rows.length > 0 ? rows : ["- none"]),
+					];
 				});
 				return {
 					content: [
@@ -1907,7 +1944,11 @@ async function findStoredSearchResult(
 	return undefined;
 }
 
-async function readPreviousSearchResultUrls(metaBaseDir: string, currentMetaDir: string, ops: WebPullOperations): Promise<Set<string>> {
+async function readPreviousSearchResultUrls(
+	metaBaseDir: string,
+	currentMetaDir: string,
+	ops: WebPullOperations,
+): Promise<Set<string>> {
 	const urls = new Set<string>();
 	let searchDirs: string[] = [];
 	try {
@@ -2132,15 +2173,17 @@ export function createWebFetchToolDefinition(
 			return {
 				content: [
 					{
-							type: "text",
-							text: [
+						type: "text",
+						text: [
 							`Imported ${resultId}: ${cleanPreviewText(hit.title, 180)} at ./${filename}.`,
 							`Title: ${cleanPreviewText(hit.title, 180)}`,
 							`Description: ${cleanPreviewText(hit.description) || "(no description)"}`,
 							historyLine,
 							...qualityLines,
 							...goalEvidenceLines,
-							goal ? "Use bash/read/rg on the full local file for additional evidence." : "Use bash/read on this local file for evidence.",
+							goal
+								? "Use bash/read/rg on the full local file for additional evidence."
+								: "Use bash/read on this local file for evidence.",
 						].join("\n"),
 					},
 				],

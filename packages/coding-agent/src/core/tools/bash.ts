@@ -172,7 +172,7 @@ function parseTerminalWebCommand(command: string): TerminalWebCommand | undefine
 		return {
 			kind: "search",
 			query: "",
-			error: "Invalid web search command. Use exactly `search \"query\"`; shell operators, pipes, redirects, and substitutions are not supported.",
+			error: 'Invalid web search command. Use exactly `search "query"`; shell operators, pipes, redirects, and substitutions are not supported.',
 		};
 	}
 	const words = splitShellWords(normalized);
@@ -180,7 +180,7 @@ function parseTerminalWebCommand(command: string): TerminalWebCommand | undefine
 		return {
 			kind: "search",
 			query: "",
-			error: "Invalid web search command. Use exactly `search \"query\"` with balanced quotes.",
+			error: 'Invalid web search command. Use exactly `search "query"` with balanced quotes.',
 		};
 	}
 	const [program, ...args] = words;
@@ -193,7 +193,11 @@ function parseTerminalWebCommand(command: string): TerminalWebCommand | undefine
 			if (arg === "--goal" || arg === "-g") {
 				const value = args[index + 1];
 				if (!value) {
-					return { kind: "import", resultId, error: "Invalid import command. Use `import <resultId> --goal \"focused evidence goal\"`." };
+					return {
+						kind: "import",
+						resultId,
+						error: 'Invalid import command. Use `import <resultId> --goal "focused evidence goal"`.',
+					};
 				}
 				goal = value;
 				index++;
@@ -202,7 +206,11 @@ function parseTerminalWebCommand(command: string): TerminalWebCommand | undefine
 			if (arg.startsWith("--goal=")) {
 				const value = arg.slice("--goal=".length).trim();
 				if (!value) {
-					return { kind: "import", resultId, error: "Invalid import command. Use `import <resultId> --goal \"focused evidence goal\"`." };
+					return {
+						kind: "import",
+						resultId,
+						error: 'Invalid import command. Use `import <resultId> --goal "focused evidence goal"`.',
+					};
 				}
 				goal = value;
 				continue;
@@ -210,14 +218,14 @@ function parseTerminalWebCommand(command: string): TerminalWebCommand | undefine
 			return {
 				kind: "import",
 				resultId,
-				error: "Invalid import command. Use `import <resultId> --goal \"focused evidence goal\"`.",
+				error: 'Invalid import command. Use `import <resultId> --goal "focused evidence goal"`.',
 			};
 		}
 		if (!goal) {
 			return {
 				kind: "import",
 				resultId,
-				error: "Import requires a focused evidence goal. Use `import <resultId> --goal \"what evidence to verify\"`.",
+				error: 'Import requires a focused evidence goal. Use `import <resultId> --goal "what evidence to verify"`.',
 			};
 		}
 		return { kind: "import", resultId, goal };
@@ -230,7 +238,7 @@ function parseTerminalWebCommand(command: string): TerminalWebCommand | undefine
 			return {
 				kind: "search",
 				query: "",
-				error: "Search depth is fixed for this run. Use exactly `search \"query\"`; each search returns the top 10 candidates.",
+				error: 'Search depth is fixed for this run. Use exactly `search "query"`; each search returns the top 10 candidates.',
 			};
 		}
 		queryParts.push(arg);
@@ -271,7 +279,7 @@ function parseTerminalPullCommand(command: string): TerminalPullCommand | undefi
 		if (arg === "--query" || arg === "-q") {
 			const value = args[index + 1];
 			if (!value) {
-				return { kind: "pull", query: "", topK: 0, error: 'pull requires a non-empty query after --query.' };
+				return { kind: "pull", query: "", topK: 0, error: "pull requires a non-empty query after --query." };
 			}
 			query = value;
 			index++;
@@ -311,7 +319,12 @@ function parseTerminalPullCommand(command: string): TerminalPullCommand | undefi
 	if (!query && positional.length > 0) query = positional.join(" ");
 	query = query.replace(/\s+/g, " ").trim();
 	if (!query) {
-		return { kind: "pull", query: "", topK: 0, error: 'pull requires a query. Use `pull --query "query terms" --topK 600`.' };
+		return {
+			kind: "pull",
+			query: "",
+			topK: 0,
+			error: 'pull requires a query. Use `pull --query "query terms" --topK 600`.',
+		};
 	}
 	if (!Number.isFinite(topK) || topK === undefined) {
 		return { kind: "pull", query, topK: 0, error: "pull requires an integer topK, for example `--topK 600`." };
@@ -330,8 +343,7 @@ async function executeTerminalWebCommand(
 	if (parsed.kind === "import" && parsed.error) {
 		return { content: [{ type: "text", text: parsed.error }], details: undefined };
 	}
-	const tool =
-		parsed.kind === "search" ? createWebSearchToolDefinition(cwd) : createWebFetchToolDefinition(cwd);
+	const tool = parsed.kind === "search" ? createWebSearchToolDefinition(cwd) : createWebFetchToolDefinition(cwd);
 	const params =
 		parsed.kind === "search"
 			? { query: parsed.query, topK: 10 }
@@ -350,7 +362,13 @@ async function executeTerminalPullCommand(
 		return { content: [{ type: "text", text: parsed.error }], details: undefined };
 	}
 	const tool = createPullToolDefinition(cwd);
-	const result = await tool.execute("terminal-pull", { query: parsed.query, topK: parsed.topK }, signal, undefined, undefined as any);
+	const result = await tool.execute(
+		"terminal-pull",
+		{ query: parsed.query, topK: parsed.topK },
+		signal,
+		undefined,
+		undefined as any,
+	);
 	const text = getTextOutput(result as any, false) || "(no output)";
 	return { content: [{ type: "text", text }], details: (result as any).details };
 }
@@ -595,8 +613,8 @@ export function createBashToolDefinition(
 		promptSnippet: pullTerminalToolsEnabled()
 			? 'Execute bash commands (ls, grep, find, etc.); also supports corpus retrieval with `pull --query "query terms" --topK 600`.'
 			: webTerminalToolsEnabled()
-			? "Execute bash commands (ls, grep, find, etc.); also supports Google web search with `search \"query\"` and page import with `import resultId --goal \"focused evidence goal\"`."
-			: "Execute bash commands (ls, grep, find, etc.)",
+				? 'Execute bash commands (ls, grep, find, etc.); also supports Google web search with `search "query"` and page import with `import resultId --goal "focused evidence goal"`.'
+				: "Execute bash commands (ls, grep, find, etc.)",
 		parameters: bashSchema,
 		async execute(_toolCallId, { command }: { command: string }, signal?: AbortSignal, onUpdate?, _ctx?) {
 			if (process.env.DCI_STRIP_ABSOLUTE_PULL_VIEW_CD === "1") {
@@ -618,15 +636,15 @@ export function createBashToolDefinition(
 				return executeTerminalPullCommand(cwd, terminalPullCommand, signal);
 			}
 			if (shouldBlockNetworkCommand(command)) {
-					return {
-						content: [
-							{
-								type: "text",
-								text: webTerminalToolsEnabled()
-									? "Network access is disabled for ordinary bash commands in this isolated environment. Use `search \"query\"` for web search and `import resultId --goal \"focused evidence goal\"` to open pages; use bash only on local files."
-									: "Network access is disabled for bash in this isolated environment. Use pull(query) for web search and import(resultId) to download pages; use bash only on local files.",
-							},
-						],
+				return {
+					content: [
+						{
+							type: "text",
+							text: webTerminalToolsEnabled()
+								? 'Network access is disabled for ordinary bash commands in this isolated environment. Use `search "query"` for web search and `import resultId --goal "focused evidence goal"` to open pages; use bash only on local files.'
+								: "Network access is disabled for bash in this isolated environment. Use pull(query) for web search and import(resultId) to download pages; use bash only on local files.",
+						},
+					],
 					details: undefined,
 				};
 			}
@@ -731,7 +749,9 @@ export function createBashToolDefinition(
 							const endLine = truncation.totalLines;
 							if (truncation.lastLinePartial) {
 								// Edge case: the last line alone is larger than the byte limit.
-								const lastLineSize = formatSize(Buffer.byteLength(modelOutput.split("\n").pop() || "", "utf-8"));
+								const lastLineSize = formatSize(
+									Buffer.byteLength(modelOutput.split("\n").pop() || "", "utf-8"),
+								);
 								outputText += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). Full output saved outside model context.]`;
 							} else if (truncation.truncatedBy === "lines") {
 								outputText += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. Full output saved outside model context.]`;
