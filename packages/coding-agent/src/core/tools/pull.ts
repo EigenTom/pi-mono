@@ -197,12 +197,31 @@ function safeFilename(value: string): string {
 	const stem =
 		rawStem
 			.toLowerCase()
-			.replace(/[^a-z0-9]+/g, "_")
+			.replace(/[^\p{L}\p{N}]+/gu, "_")
 			.replace(/^_+|_+$/g, "")
 			.slice(0, 96) || "document";
 	const ext = rawExt
 		.toLowerCase()
-		.replace(/[^a-z0-9]+/g, "_")
+		.replace(/[^\p{L}\p{N}]+/gu, "_")
+		.replace(/^_+|_+$/g, "")
+		.slice(0, 16);
+	return ext ? `${stem}.${ext}` : stem;
+}
+
+function safeFlattenedFilename(value: string): string {
+	const normalized = value.replace(/\\/g, "/");
+	const lastDot = normalized.lastIndexOf(".");
+	const rawStem = lastDot > 0 ? normalized.slice(0, lastDot) : normalized;
+	const rawExt = lastDot > 0 ? normalized.slice(lastDot + 1) : "";
+	const stem =
+		rawStem
+			.toLowerCase()
+			.replace(/[^\p{L}\p{N}]+/gu, "_")
+			.replace(/^_+|_+$/g, "")
+			.slice(0, 160) || "document";
+	const ext = rawExt
+		.toLowerCase()
+		.replace(/[^\p{L}\p{N}]+/gu, "_")
 		.replace(/^_+|_+$/g, "")
 		.slice(0, 16);
 	return ext ? `${stem}.${ext}` : stem;
@@ -218,17 +237,11 @@ function rankPrefixedRelativePath(safePath: string, rank: number): string {
 }
 
 function rankPrefixedFlatPath(safePath: string, rank: number): string {
-	const normalized = safePath.replace(/\\/g, "/");
-	const lastSlash = normalized.lastIndexOf("/");
-	const basename = lastSlash >= 0 ? normalized.slice(lastSlash + 1) : normalized;
-	return `${String(rank).padStart(4, "0")}__${safeFilename(basename)}`;
+	return `${String(rank).padStart(4, "0")}__${safeFlattenedFilename(safePath)}`;
 }
 
 function safeFlatPath(safePath: string): string {
-	const normalized = safePath.replace(/\\/g, "/");
-	const lastSlash = normalized.lastIndexOf("/");
-	const basename = lastSlash >= 0 ? normalized.slice(lastSlash + 1) : normalized;
-	return safeFilename(basename);
+	return safeFlattenedFilename(safePath);
 }
 
 function qPrefixedFlatPath(safePath: string, pullIndex: number): string {
@@ -331,7 +344,10 @@ async function materializeText(args: { text: string; targetPath: string; ops: Pu
 		const firstNewline = text.indexOf("\n");
 		const secondNewline = firstNewline >= 0 ? text.indexOf("\n", firstNewline + 1) : -1;
 		const minBytes = readPositiveIntEnv("DCI_REFLOW_SINGLE_LINE_MIN_BYTES");
-		if ((firstNewline < 0 || secondNewline < 0) && (minBytes === undefined || Buffer.byteLength(text, "utf8") >= minBytes)) {
+		if (
+			(firstNewline < 0 || secondNewline < 0) &&
+			(minBytes === undefined || Buffer.byteLength(text, "utf8") >= minBytes)
+		) {
 			await ops.writeFile(targetPath, reflowLongLineText(text, width));
 			return;
 		}
@@ -617,7 +633,8 @@ export function createPullToolDefinition(cwd: string, options?: PullToolOptions)
 	const materializationMode = parsePullMaterializationMode(process.env.DCI_PULL_MATERIALIZATION_MODE);
 	const previewMode = parsePullPreviewMode(process.env.DCI_PULL_PREVIEW_MODE);
 	const previewLimit = readBoundedPositiveIntEnv("DCI_PULL_PREVIEW_LIMIT", 20, 1, 100);
-	const rankAwareMode = promptMode === "rank_aware" || promptMode === "bm25_aware" || materializationMode !== "original";
+	const rankAwareMode =
+		promptMode === "rank_aware" || promptMode === "bm25_aware" || materializationMode !== "original";
 	const discloseNewDocs =
 		materializationMode === "flat_disclosed" ||
 		materializationMode === "root_flat_disclosed" ||
@@ -698,7 +715,8 @@ export function createPullToolDefinition(cwd: string, options?: PullToolOptions)
 			: promptMode === "bm25_aware"
 				? `It accepts one query string consisting of exact keywords and short phrases per call and required topK ${topKRangeText}.`
 				: `It accepts one query string per call and required topK ${topKRangeText}.`;
-	const retrievalVerb = promptMode === "bm25_aware" ? "retrieves matching documents" : "retrieves semantically relevant documents";
+	const retrievalVerb =
+		promptMode === "bm25_aware" ? "retrieves matching documents" : "retrieves semantically relevant documents";
 	const folderDescription =
 		layout === "root"
 			? rankAwareMode
